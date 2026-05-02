@@ -5,7 +5,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from .analysis import DISCLAIMER
 from .database import ROOT, db, init_db, rows_to_dicts, seed_defaults, upsert_ticker
-from .market_data import refresh_all, refresh_if_empty
+from .market_data import refresh_all
 from .research import parse_research_signal
 
 app = FastAPI(title="Ktrade Advisor")
@@ -36,14 +36,14 @@ class WatchlistIn(BaseModel):
 
 class TickerIn(BaseModel):
     symbol: str
-    company: str | None = None
+    company: Optional[str] = None
     theme: str = "General"
 
 
 class RenameIn(BaseModel):
     name: str
-    theme: str | None = None
-    active: bool | None = None
+    theme: Optional[str] = None
+    active: Optional[bool] = None
 
 
 class ResearchIn(BaseModel):
@@ -68,7 +68,14 @@ class PositionIn(BaseModel):
 def startup() -> None:
     init_db()
     seed_defaults()
-    threading.Thread(target=refresh_if_empty, daemon=True).start()
+    threading.Thread(target=safe_startup_refresh, daemon=True).start()
+
+
+def safe_startup_refresh() -> None:
+    try:
+        refresh_all()
+    except Exception:
+        pass
 
 
 @app.get("/api/health")
@@ -95,7 +102,7 @@ def dashboard() -> dict:
             ).fetchall()
         )
         watchlists = watchlist_summary(conn)
-        settings = dict(conn.execute("SELECT key, value FROM settings").fetchall())
+        settings = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
     return {
         "market": {
             "label": settings.get("market_condition", "Mixed / cautious"),
@@ -433,4 +440,3 @@ def open_browser() -> None:
 if __name__ == "__main__":
     threading.Thread(target=open_browser, daemon=True).start()
     uvicorn.run("backend.app.main:app", host="127.0.0.1", port=8000, reload=False)
-

@@ -278,8 +278,13 @@ function WatchlistsView({ reload }: { reload: () => Promise<void> }) {
   const [name, setName] = useState('');
   const [theme, setTheme] = useState('');
   const [tickerInputs, setTickerInputs] = useState<Record<number, string>>({});
+  const [edits, setEdits] = useState<Record<number, { name: string; theme: string; active: boolean }>>({});
 
-  const load = async () => setWatchlists(await getJson<Watchlist[]>('/api/watchlists'));
+  const load = async () => {
+    const lists = await getJson<Watchlist[]>('/api/watchlists');
+    setWatchlists(lists);
+    setEdits(Object.fromEntries(lists.map((list) => [list.id, { name: list.name, theme: list.theme, active: Boolean(list.active) }])));
+  };
   useEffect(() => { load(); }, []);
 
   const create = async () => {
@@ -299,6 +304,14 @@ function WatchlistsView({ reload }: { reload: () => Promise<void> }) {
     await load();
   };
 
+  const saveList = async (id: number) => {
+    const edit = edits[id];
+    if (!edit?.name.trim()) return;
+    await sendJson(`/api/watchlists/${id}`, edit, 'PATCH');
+    await load();
+    await reload();
+  };
+
   return (
     <section className="stack">
       <div className="form-row">
@@ -312,6 +325,15 @@ function WatchlistsView({ reload }: { reload: () => Promise<void> }) {
             <div className="row">
               <div><h3>{list.name}</h3><p>{list.theme} · {list.ticker_count} tickers</p></div>
               <button className="ghost" onClick={async () => { await sendJson(`/api/watchlists/${list.id}/duplicate`); await load(); }}>Duplicate</button>
+            </div>
+            <div className="form-row nested">
+              <input value={edits[list.id]?.name || ''} onChange={(e) => setEdits({ ...edits, [list.id]: { ...edits[list.id], name: e.target.value } })} placeholder="Name" />
+              <input value={edits[list.id]?.theme || ''} onChange={(e) => setEdits({ ...edits, [list.id]: { ...edits[list.id], theme: e.target.value } })} placeholder="Theme" />
+              <label className="toggle">
+                <input type="checkbox" checked={Boolean(edits[list.id]?.active)} onChange={(e) => setEdits({ ...edits, [list.id]: { ...edits[list.id], active: e.target.checked } })} />
+                Active
+              </label>
+              <button onClick={() => saveList(list.id)}>Save</button>
             </div>
             <div className="facts">
               <span>Top <b>{list.top_opportunities}</b></span>
@@ -527,4 +549,3 @@ function SettingsView() {
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
-

@@ -11,6 +11,13 @@ fi
 
 source .venv/bin/activate
 
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm was not found."
+  echo "Please install Node.js LTS from https://nodejs.org once, then run this launcher again."
+  echo "Normal app usage after setup is still just this one launcher."
+  exit 1
+fi
+
 echo "Installing Python dependencies..."
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
@@ -25,4 +32,3 @@ npm --prefix frontend run build
 
 echo "Starting Ktrade Advisor at http://127.0.0.1:8000"
 python -m backend.app.main
-
