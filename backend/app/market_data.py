@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pandas as pd
+import yfinance as yf
+
+from .analysis import compute_indicators, market_condition, score_ticker
+from .database import db, rows_to_dicts, upsert_ticker
+
+
+def fetch_history(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, dict]:
+    ticker = yf.Ticker(symbol)
+    history = ticker.history(period=period, auto_adjust=False)
+    info = {}
+    try:
+        raw_info = ticker.get_info()
+        info = {
+            "company": raw_info.get("shortName") or raw_info.get("longName"),
+            "asset_type": "etf" if raw_info.get("quoteType") == "ETF" else "stock",
+        }
+    except Exception:
+        info = {}
+    return history, info
+
+
+def refresh_all() -> dict:
+    refreshed: list[str] = []
+    failed: list[dict] = []
+    with db() as conn:
+        tickers = rows_to_dicts(conn.execute("SELECT * FROM tickers ORDER BY symbol").fetchall())
+
+    spy_history, _ = fetch_history("SPY")
+    qqq_history, _ = fetch_history("QQQ")
+    spy_ind = compute_indicators(spy_history)
+    qqq_ind = compute_indicators(qqq_history)
+    market = market_condition(spy_ind, qqq_ind)
+
+    for ticker in tickers:
+        symbol = ticker["symbol"]
+        try:
+            history, info = fetch_history(symbol)
+            if history.empty:
+                failed.append({"symbol": symbol, "reason": "No price data returned"})
+                continue
+            ind = compute_indicators(history, spy_history)
+            with db() as conn:
+                if info.get("company") or info.get("asset_type"):
+                    conn.execute(
+                        "UPDATE tickers SET company = COALESCE(?, company), asset_type = COALESCE(?, asset_type) WHERE id = ?",
+                        (info.get("company"), info.get("asset_type"), ticker["id"]),
+                    )
+                for date, row in history.tail(260).iterrows():
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO prices (ticker_id, date, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ticker["id"],
+                            date.strftime("%Y-%m-%d"),
+                            float(row.get("Open", 0)),
+                            float(row.get("High", 0)),
+                            float(row.get("Low", 0)),
+                            float(row.get("Close", 0)),
+                            float(row.get("Volume", 0)),
+                        ),
+                    )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO indicators
+                    (ticker_id, as_of, price, ma20, ma50, ma200, rsi, macd, atr, volume_ratio, relative_strength,
+                     support, resistance, distance_to_support, distance_to_resistance, pattern_signal, earnings_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ticker["id"],
+                        ind.get("as_of"),
+                        ind.get("price"),
+                        ind.get("ma20"),
+                        ind.get("ma50"),
+                        ind.get("ma200"),
+                        ind.get("rsi"),
+                        ind.get("macd"),
+                        ind.get("atr"),
+                        ind.get("volume_ratio"),
+                        ind.get("relative_strength"),
+                        ind.get("support"),
+                        ind.get("resistance"),
+                        ind.get("distance_to_support"),
+                        ind.get("distance_to_resistance"),
+                        ind.get("pattern_signal"),
+                        None,
+                    ),
+                )
+                signals = rows_to_dicts(
+                    conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at", (ticker["id"],)).fetchall()
+                )
+                score = score_ticker(ind, signals)
+                as_of = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO scores
+                    (ticker_id, as_of, score, decision, confidence, risk, trend_label, momentum_label, volume_label,
+                     news_label, summary, suggested_action, entry_range, invalidation_level, target1, target2,
+                     hold_window, why_rating, changes_view)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ticker["id"],
+                        as_of,
+                        score["score"],
+                        score["decision"],
+                        score["confidence"],
+                        score["risk"],
+                        score["trend_label"],
+                        score["momentum_label"],
+                        score["volume_label"],
+                        score["news_label"],
+                        score["summary"],
+                        score["suggested_action"],
+                        score["entry_range"],
+                        score["invalidation_level"],
+                        score["target1"],
+                        score["target2"],
+                        score["hold_window"],
+                        score["why_rating"],
+                        score["changes_view"],
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO recommendations
+                    (ticker_id, price, score, decision, entry_range, invalidation_level, target1, target2, market_condition, explanation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ticker["id"],
+                        ind.get("price"),
+                        score["score"],
+                        score["decision"],
+                        score["entry_range"],
+                        score["invalidation_level"],
+                        score["target1"],
+                        score["target2"],
+                        market.label,
+                        score["summary"],
+                    ),
+                )
+            refreshed.append(symbol)
+        except Exception as exc:
+            failed.append({"symbol": symbol, "reason": str(exc)})
+
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('market_condition', ?)", (market.label,))
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('market_explanation', ?)", (market.explanation,))
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_refresh', ?)", (datetime.now(timezone.utc).isoformat(),))
+    return {"refreshed": refreshed, "failed": failed, "market": market.__dict__}
+
+
+def refresh_if_empty() -> None:
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
+    if count == 0:
+        try:
+            refresh_all()
+        except Exception:
+            pass
+
