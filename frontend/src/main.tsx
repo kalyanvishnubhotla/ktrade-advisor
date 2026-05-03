@@ -56,6 +56,10 @@ type Card = {
   invalidation_level?: string;
   target1?: string;
   target2?: string;
+  distance_to_buy_zone?: number;
+  buy_zone_confluence?: number;
+  buy_zone_explanation?: string;
+  target_zone_explanation?: string;
   hold_window?: string;
   why_rating?: string;
   changes_view?: string;
@@ -65,6 +69,8 @@ type Card = {
   latest_news_title?: string;
   latest_news_source?: string;
   latest_news_link?: string;
+  nearest_support_zone?: SRZone | null;
+  nearest_resistance_zone?: SRZone | null;
 };
 
 type Watchlist = {
@@ -104,6 +110,16 @@ type NewsItem = {
   sentiment: string;
   tickers?: string;
   match_reason?: string;
+};
+
+type SRZone = {
+  zone_type: 'support' | 'resistance';
+  price_low: number;
+  price_high: number;
+  strength_score: number;
+  confluence_score: number;
+  plain_english: string;
+  sources: Array<{ method: string; label: string; weight: number; timeframe: string }>;
 };
 
 async function getJson<T>(url: string): Promise<T> {
@@ -358,6 +374,7 @@ function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolea
         <span>Risk <b>{card.risk || '--'}</b></span>
         <span>Confidence <b>{card.confidence || '--'}</b></span>
         <span>News <b>{card.news_count || 0}</b></span>
+        {card.buy_zone_confluence ? <span>Zone <b>{Math.round(card.buy_zone_confluence)}/100</b></span> : null}
       </div>
       {card.latest_news_title && (
         <a className="news-teaser" href={card.latest_news_link} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
@@ -365,6 +382,21 @@ function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolea
         </a>
       )}
       <div className="plain-list">
+        {card.distance_to_buy_zone !== null && card.distance_to_buy_zone !== undefined && (
+          <span>Distance to buy zone: {card.distance_to_buy_zone.toFixed(1)}%</span>
+        )}
+        {card.buy_zone_explanation && (
+          <span>Buy zone basis: {card.buy_zone_explanation}</span>
+        )}
+        {card.target_zone_explanation && (
+          <span>Target basis: {card.target_zone_explanation}</span>
+        )}
+        {card.nearest_support_zone && (
+          <span>Demand zone: {card.nearest_support_zone.plain_english}</span>
+        )}
+        {card.nearest_resistance_zone && (
+          <span>Supply zone: {card.nearest_resistance_zone.plain_english}</span>
+        )}
         <PriceLine label="Pivot support" value={card.support ? `$${card.support.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown buyers may step in around here. It is not a guaranteed floor." />
         <PriceLine label="Pivot resistance" value={card.resistance ? `$${card.resistance.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown sellers or hesitation may appear around here." />
         <PriceLine label="Buy zone" value={card.entry_range || '--'} showHelp={showHelp} help="A price area where the setup may offer cleaner risk/reward. It is not a command to buy." />

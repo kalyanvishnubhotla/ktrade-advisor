@@ -100,6 +100,38 @@ def init_db() -> None:
                 UNIQUE(ticker_id, date, type, timeframe, lookback)
             );
 
+            CREATE TABLE IF NOT EXISTS fib_zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker_id INTEGER NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
+                setup_direction TEXT NOT NULL CHECK(setup_direction IN ('up', 'down')),
+                swing_start_date TEXT NOT NULL,
+                swing_start_price REAL NOT NULL,
+                swing_end_date TEXT NOT NULL,
+                swing_end_price REAL NOT NULL,
+                level_name TEXT NOT NULL,
+                ratio_low REAL NOT NULL,
+                ratio_high REAL NOT NULL,
+                price_low REAL NOT NULL,
+                price_high REAL NOT NULL,
+                snapped_price_low REAL,
+                snapped_price_high REAL,
+                confluence_note TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS sr_zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker_id INTEGER NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
+                zone_type TEXT NOT NULL CHECK(zone_type IN ('support', 'resistance')),
+                price_low REAL NOT NULL,
+                price_high REAL NOT NULL,
+                strength_score REAL NOT NULL,
+                confluence_score REAL NOT NULL,
+                sources_json TEXT NOT NULL,
+                plain_english TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS scores (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker_id INTEGER NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
@@ -118,6 +150,10 @@ def init_db() -> None:
                 invalidation_level TEXT,
                 target1 TEXT,
                 target2 TEXT,
+                distance_to_buy_zone REAL,
+                buy_zone_confluence REAL,
+                buy_zone_explanation TEXT,
+                target_zone_explanation TEXT,
                 hold_window TEXT,
                 why_rating TEXT,
                 changes_view TEXT,
@@ -204,6 +240,15 @@ def init_db() -> None:
             );
             """
         )
+        existing = [row["name"] for row in conn.execute("PRAGMA table_info(scores)").fetchall()]
+        for column, definition in [
+            ("distance_to_buy_zone", "REAL"),
+            ("buy_zone_confluence", "REAL"),
+            ("buy_zone_explanation", "TEXT"),
+            ("target_zone_explanation", "TEXT"),
+        ]:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE scores ADD COLUMN {column} {definition}")
 
 
 def seed_defaults() -> None:

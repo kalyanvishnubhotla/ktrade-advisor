@@ -71,3 +71,15 @@ This prints recent daily/weekly swing highs and lows, including price, date, typ
 ```
 
 This compares the old 60-day high/low method with the new multi-timeframe pivot method. For example, AEP recently showed old support near `$119.71`, while the pivot method found nearer swing support around `$131.20`.
+
+```bash
+.venv/bin/python scripts/show_fibs.py AEP
+```
+
+This shows the selected recent Fibonacci swing, standard retracement levels, the Golden Zone, and any nearby pivot confluence used to snap zone boundaries.
+
+```bash
+.venv/bin/python scripts/show_zones.py AEP
+```
+
+This shows unified support/resistance zones built from swing pivots, Fibonacci zones, and 50/200-day moving averages, including confluence score and plain-English explanation.

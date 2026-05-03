@@ -15,9 +15,11 @@ from pydantic import BaseModel
 
 from .analysis import DISCLAIMER
 from .database import ROOT, db, init_db, rows_to_dicts, seed_defaults, upsert_ticker
+from .fibonacci import cached_fib_zones
 from .market_data import refresh_all
 from .news import RSS_SOURCES, latest_news, news_for_ticker, refresh_news
 from .pivots import cached_pivots, major_swings
+from .zones import cached_sr_zones, nearest_zones
 from .research import parse_research_signal
 
 app = FastAPI(title="Ktrade Advisor")
@@ -104,7 +106,8 @@ def dashboard() -> dict:
                        i.price, i.as_of, i.support, i.resistance, i.distance_to_support, i.distance_to_resistance,
                        i.pattern_signal, s.score, s.decision, s.confidence, s.risk, s.trend_label, s.momentum_label,
                        s.volume_label, s.news_label, s.summary, s.suggested_action, s.entry_range,
-                       s.invalidation_level, s.target1, s.target2, s.hold_window, s.why_rating, s.changes_view,
+                       s.invalidation_level, s.target1, s.target2, s.distance_to_buy_zone, s.buy_zone_confluence,
+                       s.buy_zone_explanation, s.target_zone_explanation, s.hold_window, s.why_rating, s.changes_view,
                        (SELECT COUNT(*) FROM news_ticker_matches WHERE ticker_id = t.id) AS news_count,
                        (SELECT COUNT(*) FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id AND ni.sentiment = 'Positive') AS positive_news_count,
                        (SELECT COUNT(*) FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id AND ni.sentiment = 'Negative') AS negative_news_count,
@@ -118,6 +121,11 @@ def dashboard() -> dict:
                 """
             ).fetchall()
         )
+        for card in cards:
+            if card.get("price"):
+                support_zone, resistance_zone = nearest_zones(card["ticker_id"], card["price"])
+                card["nearest_support_zone"] = support_zone
+                card["nearest_resistance_zone"] = resistance_zone
         watchlists = watchlist_summary(conn)
         settings = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
     return {
@@ -307,12 +315,16 @@ def ticker_detail(symbol: str) -> dict:
         research = rows_to_dicts(conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at DESC", (ticker_id,)).fetchall())
         recommendations = rows_to_dicts(conn.execute("SELECT * FROM recommendations WHERE ticker_id = ? ORDER BY created_at DESC LIMIT 20", (ticker_id,)).fetchall())
         pivots = cached_pivots(ticker_id)
+        fib_zones = cached_fib_zones(ticker_id)
+        sr_zones = cached_sr_zones(ticker_id)
     return {
         "ticker": dict(ticker),
         "prices": list(reversed(prices)),
         "indicators": dict(indicators) if indicators else None,
         "pivots": pivots,
         "major_pivots": major_swings(pivots),
+        "fib_zones": fib_zones,
+        "sr_zones": sr_zones,
         "scores": scores,
         "research": research,
         "news": news_for_ticker(ticker_id),

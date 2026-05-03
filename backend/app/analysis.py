@@ -140,7 +140,7 @@ def plain_distance(value: float | None, near_word: str, far_word: str) -> str:
     return f"it is stretched from {far_word}"
 
 
-def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3) -> dict:
+def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3, zone_context: dict | None = None) -> dict:
     price = ind.get("price") or 0
     ma20 = ind.get("ma20")
     ma50 = ind.get("ma50")
@@ -151,6 +151,10 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     support = ind.get("support")
     resistance = ind.get("resistance")
     atr = ind.get("atr") or 0
+    zone_context = zone_context or {}
+    demand_zone = zone_context.get("buy_zone")
+    supply_zones = zone_context.get("target_zones") or []
+    fib_extensions = zone_context.get("fib_extensions") or {}
 
     trend = 0
     if ma20 and price > ma20:
@@ -215,9 +219,13 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         band = "Avoid"
 
     risk = "Low" if risk_reward >= 8 and score >= 70 else "Medium" if score >= 50 else "High"
-    if score >= 78 and risk != "High":
+    distance_to_buy_zone = None
+    if demand_zone and price:
+        distance_to_buy_zone = max(0, (price / demand_zone["price_high"] - 1) * 100)
+
+    if score >= 78 and risk != "High" and (distance_to_buy_zone is None or distance_to_buy_zone <= 3):
         decision = "Buy-worthy now"
-    elif score >= 68 and ind.get("distance_to_support") and ind["distance_to_support"] > 12:
+    elif score >= 68 and ((distance_to_buy_zone is not None and distance_to_buy_zone > 4) or (ind.get("distance_to_support") and ind["distance_to_support"] > 12)):
         decision = "Wait for better price"
     elif score >= 64 and pattern_text == "Near breakout area":
         decision = "Watch for breakout"
@@ -244,10 +252,14 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     }[trend_label]
 
     if decision == "Buy-worthy now":
-        summary = f"The setup qualifies because {trend_phrase}, {support_phrase}, and {volume_phrase}. Keep position size modest if risk is {risk.lower()}."
+        zone_text = f"near a {demand_zone['confluence_score']:.0f}/100 demand zone" if demand_zone else support_phrase
+        summary = f"The setup qualifies because {trend_phrase}, price is {zone_text}, and {volume_phrase}. Keep position size modest if risk is {risk.lower()}."
         action = "Consider a small starter buy only if it fits your portfolio and risk limit."
     elif decision == "Wait for better price":
-        summary = f"The score is decent, but {support_phrase}. Waiting closer to the buy zone may give a cleaner risk/reward."
+        if demand_zone and distance_to_buy_zone is not None:
+            summary = f"The score is decent, but price is about {distance_to_buy_zone:.1f}% above the best demand zone. Waiting closer to that zone may give cleaner risk/reward."
+        else:
+            summary = f"The score is decent, but {support_phrase}. Waiting closer to the buy zone may give a cleaner risk/reward."
         action = "Set an alert near the buy zone instead of chasing today’s price."
     elif decision == "Watch for breakout":
         summary = f"It is close to an area worth watching; {target_phrase}. A stronger close with healthy volume would improve the setup."
@@ -259,14 +271,28 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         summary = f"The evidence is mixed: {trend_phrase}, momentum is {momentum_label.lower()}, and {target_phrase}. New buying does not look urgent."
         action = "Hold or wait for a clearer setup."
 
-    entry_low = support * 1.02 if support else price * 0.97
-    entry_high = min(price * 1.02, support * 1.08) if support else price * 1.02
-    if resistance and resistance > entry_low:
-        entry_high = min(entry_high, resistance * 0.98)
-    entry_high = max(entry_low, entry_high)
-    invalidation = support * 0.97 if support else price * 0.92
-    target1 = resistance if resistance and resistance > price else price * 1.08
-    target2 = price + (target1 - price) * 1.8 if target1 else price * 1.15
+    if demand_zone:
+        entry_low = demand_zone["price_low"]
+        entry_high = demand_zone["price_high"]
+        buffer = max((atr or 0) * 0.5, entry_low * 0.025)
+        invalidation = entry_low - buffer
+    else:
+        entry_low = support * 1.02 if support else price * 0.97
+        entry_high = min(price * 1.02, support * 1.08) if support else price * 1.02
+        invalidation = support * 0.97 if support else price * 0.92
+
+    if supply_zones:
+        first_supply = supply_zones[0]
+        target1 = first_supply["price_high"] if first_supply["price_low"] <= price <= first_supply["price_high"] else first_supply["price_low"]
+        target2 = supply_zones[1]["price_low"] if len(supply_zones) > 1 else first_supply["price_high"]
+    else:
+        target1 = resistance if resistance and resistance > price else fib_extensions.get("1.272") or price * 1.08
+        target2 = fib_extensions.get("1.618") or (price + (target1 - price) * 1.8 if target1 else price * 1.15)
+
+    if target1 <= price and not supply_zones and fib_extensions.get("1.272"):
+        target1 = fib_extensions["1.272"]
+    if target2 <= target1 and fib_extensions.get("1.618"):
+        target2 = fib_extensions["1.618"]
 
     return {
         "score": score,
@@ -284,6 +310,10 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         "invalidation_level": f"${invalidation:.2f}",
         "target1": f"${target1:.2f}",
         "target2": f"${target2:.2f}",
+        "distance_to_buy_zone": round(distance_to_buy_zone, 1) if distance_to_buy_zone is not None else None,
+        "buy_zone_confluence": round(demand_zone["confluence_score"], 0) if demand_zone else None,
+        "buy_zone_explanation": demand_zone.get("plain_english") if demand_zone else None,
+        "target_zone_explanation": supply_zones[0].get("plain_english") if supply_zones else None,
         "hold_window": "4-8 weeks for a swing setup; longer only if fundamentals still fit.",
         "why_rating": f"Trend is {label(trend, 16, 11, 6).lower()}, momentum is {label(momentum, 12, 9, 5).lower()}, research is {news_label.lower()}, and risk is {risk.lower()}.",
         "changes_view": "A break below the risk level, weakening market, negative research, or heavy selling would lower the rating.",

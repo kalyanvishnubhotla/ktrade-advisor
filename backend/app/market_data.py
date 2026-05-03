@@ -7,8 +7,10 @@ import yfinance as yf
 
 from .analysis import compute_indicators, market_condition, score_ticker
 from .database import db, rows_to_dicts, upsert_ticker
+from .fibonacci import cache_fib_zones, calculate_fib_extensions, calculate_recent_fib_zones
 from .news import refresh_news
 from .pivots import cache_pivots, detect_multi_timeframe_pivots, nearest_support_resistance
+from .zones import cache_sr_zones, calculate_sr_zones, recommendation_zones
 
 
 def fetch_history(symbol: str, period: str = "2y") -> tuple[pd.DataFrame, dict]:
@@ -47,6 +49,10 @@ def refresh_all() -> dict:
                 continue
             ind = compute_indicators(history, spy_history)
             pivots = detect_multi_timeframe_pivots(history)
+            fib_setup, fib_zones = calculate_recent_fib_zones(pivots)
+            sr_zones = calculate_sr_zones(pivots, fib_zones, ind)
+            buy_zone, target_zones = recommendation_zones(sr_zones, ind.get("price") or 0)
+            fib_extensions = calculate_fib_extensions(fib_setup.start_price, fib_setup.end_price) if fib_setup else {}
             support, resistance = nearest_support_resistance(pivots, ind.get("price") or 0)
             if support:
                 ind["support"] = support
@@ -55,6 +61,8 @@ def refresh_all() -> dict:
                 ind["resistance"] = resistance
                 ind["distance_to_resistance"] = (resistance / ind["price"] - 1) * 100 if ind.get("price") else None
             cache_pivots(ticker["id"], pivots)
+            cache_fib_zones(ticker["id"], fib_setup, fib_zones)
+            cache_sr_zones(ticker["id"], sr_zones)
             with db() as conn:
                 if info.get("company") or info.get("asset_type"):
                     conn.execute(
@@ -107,15 +115,24 @@ def refresh_all() -> dict:
                 signals = rows_to_dicts(
                     conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at", (ticker["id"],)).fetchall()
                 )
-                score = score_ticker(ind, signals)
+                score = score_ticker(
+                    ind,
+                    signals,
+                    zone_context={
+                        "buy_zone": buy_zone,
+                        "target_zones": target_zones,
+                        "fib_extensions": {"1.272": fib_extensions.get(1.272), "1.618": fib_extensions.get(1.618)},
+                    },
+                )
                 as_of = datetime.now(timezone.utc).isoformat()
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO scores
                     (ticker_id, as_of, score, decision, confidence, risk, trend_label, momentum_label, volume_label,
                      news_label, summary, suggested_action, entry_range, invalidation_level, target1, target2,
+                     distance_to_buy_zone, buy_zone_confluence, buy_zone_explanation, target_zone_explanation,
                      hold_window, why_rating, changes_view)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ticker["id"],
@@ -134,6 +151,10 @@ def refresh_all() -> dict:
                         score["invalidation_level"],
                         score["target1"],
                         score["target2"],
+                        score["distance_to_buy_zone"],
+                        score["buy_zone_confluence"],
+                        score["buy_zone_explanation"],
+                        score["target_zone_explanation"],
                         score["hold_window"],
                         score["why_rating"],
                         score["changes_view"],
