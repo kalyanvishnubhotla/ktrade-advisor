@@ -261,6 +261,9 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
 
     entry_low = support * 1.02 if support else price * 0.97
     entry_high = min(price * 1.02, support * 1.08) if support else price * 1.02
+    if resistance and resistance > entry_low:
+        entry_high = min(entry_high, resistance * 0.98)
+    entry_high = max(entry_low, entry_high)
     invalidation = support * 0.97 if support else price * 0.92
     target1 = resistance if resistance and resistance > price else price * 1.08
     target2 = price + (target1 - price) * 1.8 if target1 else price * 1.15

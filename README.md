@@ -56,3 +56,18 @@ start.command   Double-click macOS launcher
 - Some fields, such as earnings proximity, depend on availability from `yfinance`.
 - If market data is unavailable, the app keeps existing local data and marks the refresh result.
 
+## Manual Pivot Tests
+
+To understand how support and resistance are now calculated:
+
+```bash
+.venv/bin/python scripts/show_pivots.py AEP
+```
+
+This prints recent daily/weekly swing highs and lows, including price, date, type, timeframe, strength, and touch count.
+
+```bash
+.venv/bin/python scripts/compare_old_vs_pivot_support.py AEP
+```
+
+This compares the old 60-day high/low method with the new multi-timeframe pivot method. For example, AEP recently showed old support near `$119.71`, while the pivot method found nearer swing support around `$131.20`.

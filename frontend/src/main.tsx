@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   Clock,
   History,
+  Info as InfoIcon,
   LineChart,
   ListPlus,
   RefreshCw,
@@ -36,6 +37,8 @@ type Card = {
   asset_type: string;
   price?: number;
   as_of?: string;
+  support?: number;
+  resistance?: number;
   pattern_signal?: string;
   distance_to_support?: number;
   distance_to_resistance?: number;
@@ -82,6 +85,7 @@ type Watchlist = {
 type Dashboard = {
   market: { label: string; explanation: string; last_refresh?: string; failed_count?: number; error?: string };
   news: { last_refresh?: string; failed_count?: number; error?: string; latest: NewsItem[] };
+  settings: { show_beginner_price_help: boolean };
   cards: Card[];
   watchlists: Watchlist[];
   disclaimer: string;
@@ -215,7 +219,7 @@ function App() {
         {loading && <div className="panel">Loading local dashboard...</div>}
 
         {!loading && page === 'dashboard' && dashboard && (
-          <DashboardView cards={cards} watchlists={dashboard.watchlists} news={dashboard.news.latest} onSelect={(symbol) => { setSelectedTicker(symbol); setPage('ticker'); }} />
+          <DashboardView cards={cards} watchlists={dashboard.watchlists} news={dashboard.news.latest} showHelp={dashboard.settings.show_beginner_price_help} onSelect={(symbol) => { setSelectedTicker(symbol); setPage('ticker'); }} />
         )}
         {!loading && page === 'watchlists' && <WatchlistsView reload={load} />}
         {!loading && page === 'ticker' && <TickerView symbol={selectedTicker} setSymbol={setSelectedTicker} />}
@@ -232,7 +236,7 @@ function NavButton({ page, current, setPage, icon, label }: { page: Page; curren
   return <button className={current === page ? 'nav active' : 'nav'} onClick={() => setPage(page)}>{icon}{label}</button>;
 }
 
-function DashboardView({ cards, watchlists, news, onSelect }: { cards: Card[]; watchlists: Watchlist[]; news: NewsItem[]; onSelect: (symbol: string) => void }) {
+function DashboardView({ cards, watchlists, news, showHelp, onSelect }: { cards: Card[]; watchlists: Watchlist[]; news: NewsItem[]; showHelp: boolean; onSelect: (symbol: string) => void }) {
   const [view, setView] = useState<'cards' | 'table'>('cards');
   const counts = {
     buy: cards.filter((c) => c.decision === 'Buy-worthy now').length,
@@ -264,7 +268,7 @@ function DashboardView({ cards, watchlists, news, onSelect }: { cards: Card[]; w
       </div>
       {view === 'cards' ? (
         <div className="card-grid">
-          {cards.map((card) => <TickerCard key={card.symbol} card={card} onSelect={onSelect} />)}
+          {cards.map((card) => <TickerCard key={card.symbol} card={card} showHelp={showHelp} onSelect={onSelect} />)}
         </div>
       ) : (
         <RecommendationTable cards={cards} onSelect={onSelect} />
@@ -319,7 +323,25 @@ function RecommendationTable({ cards, onSelect }: { cards: Card[]; onSelect: (sy
   );
 }
 
-function TickerCard({ card, onSelect }: { card: Card; onSelect: (symbol: string) => void }) {
+function HelpIcon({ text }: { text: string }) {
+  return (
+    <span className="info-wrap" tabIndex={0} aria-label={text} onClick={(event) => event.stopPropagation()}>
+      <InfoIcon size={14} />
+      <span className="tooltip">{text}</span>
+    </span>
+  );
+}
+
+function PriceLine({ label, value, help, showHelp }: { label: string; value: string; help: string; showHelp: boolean }) {
+  return (
+    <span>
+      {label}: {value}
+      {showHelp && <HelpIcon text={help} />}
+    </span>
+  );
+}
+
+function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolean; onSelect: (symbol: string) => void }) {
   return (
     <article className="ticker-card" onClick={() => onSelect(card.symbol)}>
       <div className="ticker-top">
@@ -343,9 +365,11 @@ function TickerCard({ card, onSelect }: { card: Card; onSelect: (symbol: string)
         </a>
       )}
       <div className="plain-list">
-        <span>Buy zone: {card.entry_range || '--'}</span>
-        <span>Risk level: {card.invalidation_level || '--'}</span>
-        <span>Review targets: {card.target1 || '--'} / {card.target2 || '--'}</span>
+        <PriceLine label="Pivot support" value={card.support ? `$${card.support.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown buyers may step in around here. It is not a guaranteed floor." />
+        <PriceLine label="Pivot resistance" value={card.resistance ? `$${card.resistance.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown sellers or hesitation may appear around here." />
+        <PriceLine label="Buy zone" value={card.entry_range || '--'} showHelp={showHelp} help="A price area where the setup may offer cleaner risk/reward. It is not a command to buy." />
+        <PriceLine label="Risk level" value={card.invalidation_level || '--'} showHelp={showHelp} help="If price falls below this area and stays weak, the setup may be breaking down." />
+        <PriceLine label="Review targets" value={`${card.target1 || '--'} / ${card.target2 || '--'}`} showHelp={showHelp} help="Price areas to reassess, not automatic sell points and not guarantees." />
       </div>
     </article>
   );
@@ -738,8 +762,12 @@ function LearningView() {
 
 function SettingsView() {
   const [positions, setPositions] = useState<any>(null);
+  const [settings, setSettings] = useState<{ show_beginner_price_help: boolean } | null>(null);
   const [form, setForm] = useState({ ticker: '', shares: '', cost: '', theme: '' });
-  const load = async () => setPositions(await getJson('/api/positions'));
+  const load = async () => {
+    setPositions(await getJson('/api/positions'));
+    setSettings(await getJson('/api/settings'));
+  };
   useEffect(() => { load(); }, []);
   const save = async () => {
     await sendJson('/api/positions', { ticker: form.ticker, shares: Number(form.shares), cost: Number(form.cost), theme: form.theme || 'General' });
@@ -748,6 +776,22 @@ function SettingsView() {
   };
   return (
     <section className="stack">
+      <div className="panel">
+        <h3>Learning Help</h3>
+        <label className="toggle setting-toggle">
+          <input
+            type="checkbox"
+            checked={Boolean(settings?.show_beginner_price_help)}
+            onChange={async (event) => {
+              const next = event.target.checked;
+              setSettings({ show_beginner_price_help: next });
+              await sendJson('/api/settings/show_beginner_price_help', { value: String(next) }, 'PATCH');
+            }}
+          />
+          Show information icons for price levels
+        </label>
+        <p>Enabled by default. Turn this off once support, resistance, buy zones, risk levels, and review targets feel familiar.</p>
+      </div>
       <div className="panel">
         <h3>Portfolio Input</h3>
         <div className="form-row">

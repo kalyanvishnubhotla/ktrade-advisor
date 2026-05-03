@@ -17,6 +17,7 @@ from .analysis import DISCLAIMER
 from .database import ROOT, db, init_db, rows_to_dicts, seed_defaults, upsert_ticker
 from .market_data import refresh_all
 from .news import RSS_SOURCES, latest_news, news_for_ticker, refresh_news
+from .pivots import cached_pivots, major_swings
 from .research import parse_research_signal
 
 app = FastAPI(title="Ktrade Advisor")
@@ -68,6 +69,10 @@ class PositionIn(BaseModel):
     shares: float
     cost: float
     theme: str = "General"
+
+
+class SettingIn(BaseModel):
+    value: str
 
 
 @app.on_event("startup")
@@ -129,6 +134,9 @@ def dashboard() -> dict:
             "error": settings.get("last_news_error", ""),
             "latest": latest_news(12),
         },
+        "settings": {
+            "show_beginner_price_help": settings.get("show_beginner_price_help", "true").lower() != "false",
+        },
         "cards": cards,
         "watchlists": watchlists,
         "disclaimer": DISCLAIMER,
@@ -177,6 +185,23 @@ def refresh_news_endpoint() -> dict:
 @app.get("/api/news")
 def get_news() -> dict:
     return {"sources": RSS_SOURCES, "items": latest_news(80)}
+
+
+@app.get("/api/settings")
+def get_settings() -> dict:
+    with db() as conn:
+        rows = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+    return {"show_beginner_price_help": rows.get("show_beginner_price_help", "true").lower() != "false"}
+
+
+@app.patch("/api/settings/{key}")
+def update_setting(key: str, payload: SettingIn) -> dict:
+    allowed = {"show_beginner_price_help"}
+    if key not in allowed:
+        raise HTTPException(400, "Unknown setting")
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, payload.value))
+    return {"ok": True}
 
 
 @app.get("/api/watchlists")
@@ -281,10 +306,13 @@ def ticker_detail(symbol: str) -> dict:
         scores = rows_to_dicts(conn.execute("SELECT * FROM scores WHERE ticker_id = ? ORDER BY as_of DESC LIMIT 20", (ticker_id,)).fetchall())
         research = rows_to_dicts(conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at DESC", (ticker_id,)).fetchall())
         recommendations = rows_to_dicts(conn.execute("SELECT * FROM recommendations WHERE ticker_id = ? ORDER BY created_at DESC LIMIT 20", (ticker_id,)).fetchall())
+        pivots = cached_pivots(ticker_id)
     return {
         "ticker": dict(ticker),
         "prices": list(reversed(prices)),
         "indicators": dict(indicators) if indicators else None,
+        "pivots": pivots,
+        "major_pivots": major_swings(pivots),
         "scores": scores,
         "research": research,
         "news": news_for_ticker(ticker_id),

@@ -8,9 +8,10 @@ import yfinance as yf
 from .analysis import compute_indicators, market_condition, score_ticker
 from .database import db, rows_to_dicts, upsert_ticker
 from .news import refresh_news
+from .pivots import cache_pivots, detect_multi_timeframe_pivots, nearest_support_resistance
 
 
-def fetch_history(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, dict]:
+def fetch_history(symbol: str, period: str = "2y") -> tuple[pd.DataFrame, dict]:
     ticker = yf.Ticker(symbol)
     history = ticker.history(period=period, auto_adjust=False)
     info = {}
@@ -45,6 +46,15 @@ def refresh_all() -> dict:
                 failed.append({"symbol": symbol, "reason": "No price data returned"})
                 continue
             ind = compute_indicators(history, spy_history)
+            pivots = detect_multi_timeframe_pivots(history)
+            support, resistance = nearest_support_resistance(pivots, ind.get("price") or 0)
+            if support:
+                ind["support"] = support
+                ind["distance_to_support"] = (ind["price"] / support - 1) * 100 if ind.get("price") else None
+            if resistance:
+                ind["resistance"] = resistance
+                ind["distance_to_resistance"] = (resistance / ind["price"] - 1) * 100 if ind.get("price") else None
+            cache_pivots(ticker["id"], pivots)
             with db() as conn:
                 if info.get("company") or info.get("asset_type"):
                     conn.execute(

@@ -86,6 +86,20 @@ def init_db() -> None:
                 earnings_date TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS pivots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker_id INTEGER NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
+                date TEXT NOT NULL,
+                price REAL NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('high', 'low')),
+                strength INTEGER NOT NULL,
+                timeframe TEXT NOT NULL CHECK(timeframe IN ('daily', 'weekly')),
+                touches INTEGER NOT NULL DEFAULT 1,
+                lookback INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(ticker_id, date, type, timeframe, lookback)
+            );
+
             CREATE TABLE IF NOT EXISTS scores (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker_id INTEGER NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
