@@ -101,7 +101,7 @@ def compute_indicators(history: pd.DataFrame, spy_history: pd.DataFrame | None =
 
 
 def latest_research_adjustment(signals: list[dict]) -> tuple[int, str]:
-    approved = [s for s in signals if s.get("approved")]
+    approved = [s for s in signals if s.get("applied")]
     if not approved:
         return 7, "Neutral"
     latest = approved[-1]
@@ -126,6 +126,18 @@ def label(value: float, strong: float, good: float, mixed: float) -> str:
     if value >= mixed:
         return "Mixed"
     return "Weak"
+
+
+def plain_distance(value: float | None, near_word: str, far_word: str) -> str:
+    if value is None:
+        return "price location is unclear"
+    if value < 3:
+        return f"it is very close to {near_word}"
+    if value < 8:
+        return f"it is near {near_word}"
+    if value < 15:
+        return f"it has some room from {near_word}"
+    return f"it is stretched from {far_word}"
 
 
 def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3) -> dict:
@@ -216,20 +228,35 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     else:
         decision = "Hold / no action"
 
+    distance_support = ind.get("distance_to_support")
+    distance_resistance = ind.get("distance_to_resistance")
+    trend_label = label(trend, 16, 11, 6)
+    momentum_label = label(momentum, 12, 9, 5)
+    volume_label = label(volume, 8, 6, 4)
+    support_phrase = plain_distance(distance_support, "its support area", "a safer buy area")
+    target_phrase = plain_distance(distance_resistance, "a review target", "the next review target")
+    volume_phrase = "buyers are showing better activity" if volume_label in ["Strong", "Good"] else "volume is not adding much confirmation"
+    trend_phrase = {
+        "Strong": "the trend is in good shape",
+        "Good": "the trend is constructive",
+        "Mixed": "the trend is still uneven",
+        "Weak": "the trend needs repair",
+    }[trend_label]
+
     if decision == "Buy-worthy now":
-        summary = "The setup qualifies today, with enough trend support and risk control to consider a starter position."
+        summary = f"The setup qualifies because {trend_phrase}, {support_phrase}, and {volume_phrase}. Keep position size modest if risk is {risk.lower()}."
         action = "Consider a small starter buy only if it fits your portfolio and risk limit."
     elif decision == "Wait for better price":
-        summary = "The stock has moved up quickly and may be expensive today. Waiting for a better price may reduce risk."
-        action = "Set an alert closer to support instead of chasing strength."
+        summary = f"The score is decent, but {support_phrase}. Waiting closer to the buy zone may give a cleaner risk/reward."
+        action = "Set an alert near the buy zone instead of chasing today’s price."
     elif decision == "Watch for breakout":
-        summary = "The ticker is close to an important area. It may need a stronger move before the setup improves."
-        action = "Watch for a clean move higher with healthy volume."
+        summary = f"It is close to an area worth watching; {target_phrase}. A stronger close with healthy volume would improve the setup."
+        action = "Watch for a clean move higher with healthy volume before acting."
     elif decision == "Avoid for now":
-        summary = "The setup is weak or risk is elevated. There is no need to force action today."
+        summary = f"The setup does not qualify because {trend_phrase} and risk is {risk.lower()}. There is no need to force a buy."
         action = "Avoid new buys until the trend and risk picture improve."
     else:
-        summary = "The evidence is mixed. Existing holders can review, but new buying does not look urgent."
+        summary = f"The evidence is mixed: {trend_phrase}, momentum is {momentum_label.lower()}, and {target_phrase}. New buying does not look urgent."
         action = "Hold or wait for a clearer setup."
 
     entry_low = support * 1.02 if support else price * 0.97
@@ -244,9 +271,9 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         "decision": decision,
         "confidence": "High" if score >= 80 or score < 40 else "Medium" if score >= 55 else "Low",
         "risk": risk,
-        "trend_label": label(trend, 16, 11, 6),
-        "momentum_label": label(momentum, 12, 9, 5),
-        "volume_label": label(volume, 8, 6, 4),
+        "trend_label": trend_label,
+        "momentum_label": momentum_label,
+        "volume_label": volume_label,
         "news_label": news_label,
         "summary": summary,
         "suggested_action": action,
@@ -284,4 +311,3 @@ def market_condition(spy: dict | None, qqq: dict | None) -> MarketCondition:
     if total >= 1:
         return MarketCondition("Weak", "Market Today: Weak. Waiting is a valid choice.")
     return MarketCondition("High-risk", "Market Today: High-risk. Avoid forcing new buys.")
-

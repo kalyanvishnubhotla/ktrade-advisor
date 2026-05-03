@@ -156,6 +156,25 @@ def init_db() -> None:
                 applied INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS news_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                feed_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                link TEXT NOT NULL UNIQUE,
+                published_at TEXT,
+                summary TEXT,
+                sentiment TEXT NOT NULL DEFAULT 'Neutral',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS news_ticker_matches (
+                news_item_id INTEGER NOT NULL REFERENCES news_items(id) ON DELETE CASCADE,
+                ticker_id INTEGER NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
+                match_reason TEXT NOT NULL,
+                PRIMARY KEY (news_item_id, ticker_id)
+            );
+
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker_id INTEGER NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
@@ -212,4 +231,3 @@ def upsert_ticker(conn: sqlite3.Connection, symbol: str, company: str | None = N
         (normalized, company, theme),
     )
     return int(conn.execute("SELECT id FROM tickers WHERE symbol = ?", (normalized,)).fetchone()[0])
-

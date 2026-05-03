@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from .analysis import DISCLAIMER
 from .database import ROOT, db, init_db, rows_to_dicts, seed_defaults, upsert_ticker
 from .market_data import refresh_all
+from .news import RSS_SOURCES, latest_news, news_for_ticker, refresh_news
 from .research import parse_research_signal
 
 app = FastAPI(title="Ktrade Advisor")
@@ -57,6 +58,11 @@ class ResearchApprovalIn(BaseModel):
     apply_impact: bool = False
 
 
+class NewsApplyIn(BaseModel):
+    ticker: str
+    confidence: str = "Medium"
+
+
 class PositionIn(BaseModel):
     ticker: str
     shares: float
@@ -93,7 +99,13 @@ def dashboard() -> dict:
                        i.price, i.as_of, i.support, i.resistance, i.distance_to_support, i.distance_to_resistance,
                        i.pattern_signal, s.score, s.decision, s.confidence, s.risk, s.trend_label, s.momentum_label,
                        s.volume_label, s.news_label, s.summary, s.suggested_action, s.entry_range,
-                       s.invalidation_level, s.target1, s.target2, s.hold_window, s.why_rating, s.changes_view
+                       s.invalidation_level, s.target1, s.target2, s.hold_window, s.why_rating, s.changes_view,
+                       (SELECT COUNT(*) FROM news_ticker_matches WHERE ticker_id = t.id) AS news_count,
+                       (SELECT COUNT(*) FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id AND ni.sentiment = 'Positive') AS positive_news_count,
+                       (SELECT COUNT(*) FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id AND ni.sentiment = 'Negative') AS negative_news_count,
+                       (SELECT ni.title FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id ORDER BY COALESCE(ni.published_at, ni.created_at) DESC LIMIT 1) AS latest_news_title,
+                       (SELECT ni.source FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id ORDER BY COALESCE(ni.published_at, ni.created_at) DESC LIMIT 1) AS latest_news_source,
+                       (SELECT ni.link FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id ORDER BY COALESCE(ni.published_at, ni.created_at) DESC LIMIT 1) AS latest_news_link
                 FROM tickers t
                 LEFT JOIN indicators i ON i.ticker_id = t.id
                 LEFT JOIN scores s ON s.id = (SELECT id FROM scores WHERE ticker_id = t.id ORDER BY as_of DESC LIMIT 1)
@@ -108,6 +120,14 @@ def dashboard() -> dict:
             "label": settings.get("market_condition", "Mixed / cautious"),
             "explanation": settings.get("market_explanation", "Market Today: Mixed / Cautious. Be selective."),
             "last_refresh": settings.get("last_refresh"),
+            "failed_count": int(settings.get("last_refresh_failed_count", "0")),
+            "error": settings.get("last_refresh_error", ""),
+        },
+        "news": {
+            "last_refresh": settings.get("last_news_refresh"),
+            "failed_count": int(settings.get("last_news_failed_count", "0")),
+            "error": settings.get("last_news_error", ""),
+            "latest": latest_news(12),
         },
         "cards": cards,
         "watchlists": watchlists,
@@ -147,6 +167,16 @@ def watchlist_summary(conn) -> list[dict]:
 @app.post("/api/refresh")
 def refresh() -> dict:
     return refresh_all()
+
+
+@app.post("/api/news/refresh")
+def refresh_news_endpoint() -> dict:
+    return refresh_news()
+
+
+@app.get("/api/news")
+def get_news() -> dict:
+    return {"sources": RSS_SOURCES, "items": latest_news(80)}
 
 
 @app.get("/api/watchlists")
@@ -257,6 +287,7 @@ def ticker_detail(symbol: str) -> dict:
         "indicators": dict(indicators) if indicators else None,
         "scores": scores,
         "research": research,
+        "news": news_for_ticker(ticker_id),
         "recommendations": recommendations,
     }
 
@@ -304,6 +335,44 @@ def approve_research(signal_id: int, payload: ResearchApprovalIn) -> dict:
             (int(payload.approved), int(payload.apply_impact and payload.approved), signal_id),
         )
     return {"ok": True}
+
+
+@app.post("/api/news/{news_id}/apply")
+def apply_news_signal(news_id: int, payload: NewsApplyIn) -> dict:
+    ticker_symbol = payload.ticker.strip().upper()
+    with db() as conn:
+        ticker = conn.execute("SELECT * FROM tickers WHERE symbol = ?", (ticker_symbol,)).fetchone()
+        news = conn.execute("SELECT * FROM news_items WHERE id = ?", (news_id,)).fetchone()
+        if not ticker:
+            raise HTTPException(404, "Ticker not found")
+        if not news:
+            raise HTTPException(404, "News item not found")
+        sentiment = news["sentiment"] if news["sentiment"] in ["Positive", "Negative", "Mixed"] else "Neutral"
+        impact = "Increase" if sentiment == "Positive" else "Decrease" if sentiment == "Negative" else "Caution" if sentiment == "Mixed" else "Keep"
+        cur = conn.execute(
+            """
+            INSERT INTO research_signals
+            (ticker_id, source_date, company, source_links, summary, bullish, bearish, catalyst_type, time_sensitivity,
+             sentiment, confidence, suggested_impact, reason, approved, applied)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)
+            """,
+            (
+                ticker["id"],
+                news["published_at"],
+                ticker["company"],
+                news["link"],
+                news["title"],
+                news["title"] if sentiment == "Positive" else "",
+                news["title"] if sentiment == "Negative" else "",
+                "RSS headline",
+                "Medium",
+                sentiment,
+                payload.confidence,
+                impact,
+                f"Applied by user from {news['source']} {news['feed_name']} RSS headline.",
+            ),
+        )
+    return {"ok": True, "research_signal_id": cur.lastrowid, "message": "RSS headline was applied as a research signal. Refresh to recalculate score."}
 
 
 @app.get("/api/history")

@@ -7,6 +7,7 @@ import yfinance as yf
 
 from .analysis import compute_indicators, market_condition, score_ticker
 from .database import db, rows_to_dicts, upsert_ticker
+from .news import refresh_news
 
 
 def fetch_history(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, dict]:
@@ -155,7 +156,13 @@ def refresh_all() -> dict:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('market_condition', ?)", (market.label,))
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('market_explanation', ?)", (market.explanation,))
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_refresh', ?)", (datetime.now(timezone.utc).isoformat(),))
-    return {"refreshed": refreshed, "failed": failed, "market": market.__dict__}
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_refresh_failed_count', ?)", (str(len(failed)),))
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_refresh_error', ?)",
+            ("; ".join(f"{item['symbol']}: {item['reason']}" for item in failed[:6]),),
+        )
+    news = refresh_news()
+    return {"refreshed": refreshed, "failed": failed, "market": market.__dict__, "news": news}
 
 
 def refresh_if_empty() -> None:
@@ -166,4 +173,3 @@ def refresh_if_empty() -> None:
             refresh_all()
         except Exception:
             pass
-

@@ -3,6 +3,5 @@ uvicorn[standard]==0.32.1
 pydantic==2.10.3
 pandas==2.2.3
 numpy==2.0.2
-yfinance==0.2.50
+yfinance==1.2.0
 python-multipart==0.0.19
-

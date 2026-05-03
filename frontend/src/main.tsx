@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity,
@@ -36,6 +36,9 @@ type Card = {
   asset_type: string;
   price?: number;
   as_of?: string;
+  pattern_signal?: string;
+  distance_to_support?: number;
+  distance_to_resistance?: number;
   score?: number;
   decision?: string;
   confidence?: string;
@@ -53,6 +56,12 @@ type Card = {
   hold_window?: string;
   why_rating?: string;
   changes_view?: string;
+  news_count?: number;
+  positive_news_count?: number;
+  negative_news_count?: number;
+  latest_news_title?: string;
+  latest_news_source?: string;
+  latest_news_link?: string;
 };
 
 type Watchlist = {
@@ -71,13 +80,27 @@ type Watchlist = {
 };
 
 type Dashboard = {
-  market: { label: string; explanation: string; last_refresh?: string };
+  market: { label: string; explanation: string; last_refresh?: string; failed_count?: number; error?: string };
+  news: { last_refresh?: string; failed_count?: number; error?: string; latest: NewsItem[] };
   cards: Card[];
   watchlists: Watchlist[];
   disclaimer: string;
 };
 
 type Page = 'dashboard' | 'watchlists' | 'ticker' | 'research' | 'history' | 'learning' | 'settings';
+
+type NewsItem = {
+  id: number;
+  source: string;
+  feed_name: string;
+  title: string;
+  link: string;
+  published_at?: string;
+  summary?: string;
+  sentiment: string;
+  tickers?: string;
+  match_reason?: string;
+};
 
 async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(`${API}${url}`);
@@ -141,8 +164,6 @@ function App() {
   };
 
   const cards = dashboard?.cards ?? [];
-  const topCards = useMemo(() => cards.slice(0, 8), [cards]);
-
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -179,10 +200,22 @@ function App() {
         </header>
 
         {error && <div className="alert"><ShieldAlert size={18} /> {error}</div>}
+        {dashboard?.market.failed_count ? (
+          <div className="alert">
+            <ShieldAlert size={18} />
+            Refresh could not update {dashboard.market.failed_count} ticker{dashboard.market.failed_count === 1 ? '' : 's'}. {dashboard.market.error || 'Check internet access and try again.'}
+          </div>
+        ) : null}
+        {dashboard?.news.failed_count ? (
+          <div className="alert">
+            <ShieldAlert size={18} />
+            News refresh could not update {dashboard.news.failed_count} feed{dashboard.news.failed_count === 1 ? '' : 's'}. {dashboard.news.error || 'Check internet access and try again.'}
+          </div>
+        ) : null}
         {loading && <div className="panel">Loading local dashboard...</div>}
 
         {!loading && page === 'dashboard' && dashboard && (
-          <DashboardView cards={topCards} watchlists={dashboard.watchlists} onSelect={(symbol) => { setSelectedTicker(symbol); setPage('ticker'); }} />
+          <DashboardView cards={cards} watchlists={dashboard.watchlists} news={dashboard.news.latest} onSelect={(symbol) => { setSelectedTicker(symbol); setPage('ticker'); }} />
         )}
         {!loading && page === 'watchlists' && <WatchlistsView reload={load} />}
         {!loading && page === 'ticker' && <TickerView symbol={selectedTicker} setSymbol={setSelectedTicker} />}
@@ -199,7 +232,8 @@ function NavButton({ page, current, setPage, icon, label }: { page: Page; curren
   return <button className={current === page ? 'nav active' : 'nav'} onClick={() => setPage(page)}>{icon}{label}</button>;
 }
 
-function DashboardView({ cards, watchlists, onSelect }: { cards: Card[]; watchlists: Watchlist[]; onSelect: (symbol: string) => void }) {
+function DashboardView({ cards, watchlists, news, onSelect }: { cards: Card[]; watchlists: Watchlist[]; news: NewsItem[]; onSelect: (symbol: string) => void }) {
+  const [view, setView] = useState<'cards' | 'table'>('cards');
   const counts = {
     buy: cards.filter((c) => c.decision === 'Buy-worthy now').length,
     wait: cards.filter((c) => c.decision === 'Wait for better price').length,
@@ -213,15 +247,75 @@ function DashboardView({ cards, watchlists, onSelect }: { cards: Card[]; watchli
         <Metric label="Avoid for now" value={counts.avoid} />
         <Metric label="Active watchlists" value={watchlists.filter((w) => w.active).length} />
       </div>
-      <div className="section-head"><h3>Recommendation Cards</h3><p>Ranked by local score</p></div>
-      <div className="card-grid">
-        {cards.map((card) => <TickerCard key={card.symbol} card={card} onSelect={onSelect} />)}
+      <div className="section-head">
+        <div>
+          <h3>Recommendations</h3>
+          <p>All tickers, ranked by local score</p>
+        </div>
+        <div className="segmented" aria-label="Choose recommendation view">
+          <button className={view === 'cards' ? 'selected' : ''} onClick={() => setView('cards')}>Cards</button>
+          <button className={view === 'table' ? 'selected' : ''} onClick={() => setView('table')}>Table</button>
+        </div>
       </div>
+      <div className="help-strip">
+        <span><b>Buy zone</b> is the price area where the setup looks more reasonable.</span>
+        <span><b>Risk level</b> is the price that would weaken the setup.</span>
+        <span><b>Targets</b> are review areas, not guarantees.</span>
+      </div>
+      {view === 'cards' ? (
+        <div className="card-grid">
+          {cards.map((card) => <TickerCard key={card.symbol} card={card} onSelect={onSelect} />)}
+        </div>
+      ) : (
+        <RecommendationTable cards={cards} onSelect={onSelect} />
+      )}
+      <div className="section-head"><h3>Free News Signals</h3><p>Headlines matched locally to your tickers</p></div>
+      <NewsList items={news} compact />
       <div className="section-head"><h3>Watchlist Snapshot</h3><p>Simple health checks</p></div>
       <div className="watch-grid">
         {watchlists.slice(0, 6).map((watchlist) => <WatchlistSummary key={watchlist.id} watchlist={watchlist} />)}
       </div>
     </section>
+  );
+}
+
+function RecommendationTable({ cards, onSelect }: { cards: Card[]; onSelect: (symbol: string) => void }) {
+  return (
+    <div className="table-panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Decision</th>
+            <th>Score</th>
+            <th>Price</th>
+              <th>Risk</th>
+              <th>News</th>
+              <th>Buy zone</th>
+            <th>Review targets</th>
+            <th>Plain-English read</th>
+          </tr>
+        </thead>
+        <tbody>
+          {cards.map((card) => (
+            <tr key={card.symbol} onClick={() => onSelect(card.symbol)}>
+              <td>
+                <b>{card.symbol}</b>
+                <span>{card.company || card.theme}</span>
+              </td>
+              <td>{card.decision || 'Refresh needed'}</td>
+              <td><span className={`score-mini ${scoreClass(card.score)}`}>{card.score ?? '--'}</span></td>
+              <td>{card.price ? `$${card.price.toFixed(2)}` : '--'}</td>
+              <td>{card.risk || '--'}</td>
+              <td>{card.news_count ? `${card.news_count} headline${card.news_count === 1 ? '' : 's'}` : 'No match'}</td>
+              <td>{card.entry_range || '--'}</td>
+              <td>{card.target1 || '--'} / {card.target2 || '--'}</td>
+              <td>{card.summary || 'Run a refresh to calculate this setup.'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -241,13 +335,50 @@ function TickerCard({ card, onSelect }: { card: Card; onSelect: (symbol: string)
         <span>Price <b>{card.price ? `$${card.price.toFixed(2)}` : '--'}</b></span>
         <span>Risk <b>{card.risk || '--'}</b></span>
         <span>Confidence <b>{card.confidence || '--'}</b></span>
+        <span>News <b>{card.news_count || 0}</b></span>
       </div>
+      {card.latest_news_title && (
+        <a className="news-teaser" href={card.latest_news_link} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+          {card.latest_news_source}: {card.latest_news_title}
+        </a>
+      )}
       <div className="plain-list">
-        <span>Entry: {card.entry_range || '--'}</span>
+        <span>Buy zone: {card.entry_range || '--'}</span>
         <span>Risk level: {card.invalidation_level || '--'}</span>
-        <span>Targets: {card.target1 || '--'} / {card.target2 || '--'}</span>
+        <span>Review targets: {card.target1 || '--'} / {card.target2 || '--'}</span>
       </div>
     </article>
+  );
+}
+
+function NewsList({ items, compact = false, ticker, onApplied }: { items: NewsItem[]; compact?: boolean; ticker?: string; onApplied?: () => void }) {
+  if (!items.length) {
+    return <div className="panel compact">No RSS headlines stored yet. Run Refresh to pull free news feeds.</div>;
+  }
+  return (
+    <div className={compact ? 'news-grid compact-news' : 'news-grid'}>
+      {items.map((item) => (
+        <article className="news-item" key={item.id}>
+          <div className="row">
+            <span className={`sentiment ${item.sentiment.toLowerCase()}`}>{item.sentiment}</span>
+            <span>{item.source}</span>
+          </div>
+          <h4>{item.title}</h4>
+          {item.tickers && <p>Matched: {item.tickers}</p>}
+          {item.match_reason && <p>Why matched: {item.match_reason}</p>}
+          <div className="news-actions">
+            <a href={item.link} target="_blank" rel="noreferrer">Open source</a>
+            {ticker && (
+              <button onClick={async () => {
+                await sendJson(`/api/news/${item.id}/apply`, { ticker, confidence: 'Medium' });
+                alert('Applied as a research signal. Press Refresh to recalculate the score.');
+                onApplied?.();
+              }}>Consider in score</button>
+            )}
+          </div>
+        </article>
+      ))}
+    </div>
   );
 }
 
@@ -407,12 +538,14 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (symbol:
               </ReLineChart>
             </ResponsiveContainer>
           </div>
-          <div className="info-grid">
+        <div className="info-grid">
             <Info title="Suggested action" body={score?.suggested_action} />
             <Info title="Why this rating" body={score?.why_rating} />
             <Info title="What changes the view" body={score?.changes_view} />
             <Info title="Hold window" body={score?.hold_window} />
           </div>
+          <div className="section-head"><h3>Matched RSS Headlines</h3><p>Free sources, local matching only</p></div>
+          <NewsList items={detail.news || []} ticker={detail.ticker.symbol} onApplied={() => load(detail.ticker.symbol)} />
         </>
       )}
     </section>
@@ -454,26 +587,115 @@ Increase / Decrease / Keep / Caution
 Reason:`;
   const [text, setText] = useState(template);
   const [result, setResult] = useState<any>(null);
+  const [tickerDetail, setTickerDetail] = useState<any>(null);
+  const [status, setStatus] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
 
-  const parse = async () => setResult(await sendJson('/api/research/parse', { text, approved: false, apply_impact: false }));
+  const parse = async () => {
+    setBusy(true);
+    setError('');
+    setStatus('');
+    try {
+      const parsedResult = await sendJson<any>('/api/research/parse', { text, approved: false, apply_impact: false });
+      setResult(parsedResult);
+      setStatus(`Saved ${parsedResult.parsed.ticker} research locally. Review the parsed signal below before applying it to the score.`);
+      if (parsedResult.parsed?.ticker) {
+        setTickerDetail(await getJson(`/api/tickers/${parsedResult.parsed.ticker}`));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not parse this signal. Check that it includes a Ticker field.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const approve = async (applyImpact: boolean) => {
+    if (!result?.id) return;
+    setBusy(true);
+    setError('');
+    try {
+      await sendJson(`/api/research/${result.id}/approval`, { approved: true, apply_impact: applyImpact }, 'PATCH');
+      if (applyImpact) {
+        setStatus('Impact approved. Refreshing scores now...');
+        await sendJson('/api/refresh');
+        setStatus(`${result.parsed.ticker} score refreshed with this research signal included.`);
+        setTickerDetail(await getJson(`/api/tickers/${result.parsed.ticker}`));
+      } else {
+        setStatus('Saved for reference only. This signal will not affect the score.');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not update this signal.');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <section className="stack">
-      <div className="section-head"><h3>Paste Research Signal</h3><p>Stored locally. You approve impact before it changes scoring.</p></div>
-      <textarea value={text} onChange={(e) => setText(e.target.value)} />
-      <button className="primary fit" onClick={parse}><CheckCircle2 size={18} />Parse and store</button>
+      <div className="section-head"><h3>Paste Research Signal</h3><p>Use this after ChatGPT extracts signals from an article, video, earnings note, or transcript.</p></div>
+      <div className="help-strip">
+        <span><b>Step 1</b> Paste the source link into ChatGPT and ask it to fill this format.</span>
+        <span><b>Step 2</b> Paste the structured signal here.</span>
+        <span><b>Step 3</b> Approve impact only if you agree it should affect the score.</span>
+      </div>
+      {status && <div className="success"><CheckCircle2 size={18} />{status}</div>}
+      {error && <div className="alert"><ShieldAlert size={18} />{error}</div>}
+      <div className="research-actions">
+        <button className="primary" onClick={parse} disabled={busy || !text.trim()}><CheckCircle2 size={18} />{busy ? 'Working...' : 'Parse signal'}</button>
+        <button onClick={() => { setText(template); setResult(null); setStatus(''); setError(''); }}>Reset template</button>
+      </div>
+      <textarea className="research-input" value={text} onChange={(e) => setText(e.target.value)} />
       {result && (
-        <article className="panel">
-          <h3>{result.parsed.ticker} research saved</h3>
-          <p>{result.message}</p>
-          <div className="facts">
-            <span>Sentiment <b>{result.parsed.sentiment || '--'}</b></span>
-            <span>Confidence <b>{result.parsed.confidence || '--'}</b></span>
-            <span>Impact <b>{result.parsed.suggested_impact || '--'}</b></span>
+        <article className="panel parsed-panel">
+          <div className="row">
+            <div>
+              <p className="eyebrow">Parsed Signal</p>
+              <h3>{result.parsed.ticker} · {result.parsed.company || 'Company not provided'}</h3>
+            </div>
+            <span className={`sentiment ${(result.parsed.sentiment || 'neutral').toLowerCase()}`}>{result.parsed.sentiment || 'Neutral'}</span>
           </div>
-          <button onClick={async () => { await sendJson(`/api/research/${result.id}/approval`, { approved: true, apply_impact: true }, 'PATCH'); alert('Approved. Refresh to recalculate score.'); }}>Approve impact</button>
+          <div className="facts">
+            <span>Date <b>{result.parsed.date || '--'}</b></span>
+            <span>Confidence <b>{result.parsed.confidence || '--'}</b></span>
+            <span>Suggested impact <b>{result.parsed.suggested_impact || '--'}</b></span>
+            <span>Time sensitivity <b>{result.parsed.time_sensitivity || '--'}</b></span>
+          </div>
+          <p className="summary">{result.parsed.summary || 'No research summary provided.'}</p>
+          <div className="signal-columns">
+            <div>
+              <h4>Bullish</h4>
+              <p>{result.parsed.bullish || '--'}</p>
+            </div>
+            <div>
+              <h4>Bearish</h4>
+              <p>{result.parsed.bearish || '--'}</p>
+            </div>
+          </div>
+          <div className="review-box">
+            <b>Human check</b>
+            <p>Saving keeps this as a note. Approving impact lets it affect the News/Research score after refresh.</p>
+          </div>
+          <div className="research-actions">
+            <button onClick={() => approve(false)} disabled={busy}>Save only</button>
+            <button className="primary" onClick={() => approve(true)} disabled={busy}>Approve and refresh score</button>
+          </div>
         </article>
       )}
+      {tickerDetail?.research?.length ? (
+        <article className="panel">
+          <h3>{tickerDetail.ticker.symbol} stored research signals</h3>
+          <div className="signal-list">
+            {tickerDetail.research.slice(0, 6).map((signal: any) => (
+              <div className="signal-row" key={signal.id}>
+                <b>{signal.sentiment || 'Neutral'} · {signal.confidence || 'Medium'}</b>
+                <span>{signal.applied ? 'Affects score' : signal.approved ? 'Stored only' : 'Needs review'}</span>
+                <p>{signal.summary || signal.reason || 'No summary provided.'}</p>
+              </div>
+            ))}
+          </div>
+        </article>
+      ) : null}
     </section>
   );
 }
