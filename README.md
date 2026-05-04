@@ -83,3 +83,15 @@ This shows the selected recent Fibonacci swing, standard retracement levels, the
 ```
 
 This shows unified support/resistance zones built from swing pivots, Fibonacci zones, and 50/200-day moving averages, including confluence score and plain-English explanation.
+
+```bash
+.venv/bin/python scripts/analyze_phase1.py AEP NVDA SPY
+```
+
+This runs the full Phase 1 technical analyzer and prints the decision, score, buy zone, risk level, targets, confluence, and summary.
+
+```bash
+.venv/bin/python scripts/analyze_fallback_example.py
+```
+
+This demonstrates graceful fallback when there are not enough bars to build reliable pivots, Fibonacci zones, or confluence zones.

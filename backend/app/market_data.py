@@ -3,29 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pandas as pd
-import yfinance as yf
 
-from .analysis import compute_indicators, market_condition, score_ticker
+from .analysis import compute_indicators, market_condition
 from .database import db, rows_to_dicts, upsert_ticker
-from .fibonacci import cache_fib_zones, calculate_fib_extensions, calculate_recent_fib_zones
+from .fibonacci import cache_fib_zones
 from .news import refresh_news
-from .pivots import cache_pivots, detect_multi_timeframe_pivots, nearest_support_resistance
-from .zones import cache_sr_zones, calculate_sr_zones, recommendation_zones
+from .pivots import cache_pivots
+from .technical_zone_analyzer import TechnicalZoneAnalyzer
+from .zones import cache_sr_zones
 
 
 def fetch_history(symbol: str, period: str = "2y") -> tuple[pd.DataFrame, dict]:
-    ticker = yf.Ticker(symbol)
-    history = ticker.history(period=period, auto_adjust=False)
-    info = {}
-    try:
-        raw_info = ticker.get_info()
-        info = {
-            "company": raw_info.get("shortName") or raw_info.get("longName"),
-            "asset_type": "etf" if raw_info.get("quoteType") == "ETF" else "stock",
-        }
-    except Exception:
-        info = {}
-    return history, info
+    return TechnicalZoneAnalyzer(period=period).fetch_latest_data(symbol)
 
 
 def refresh_all() -> dict:
@@ -39,30 +28,23 @@ def refresh_all() -> dict:
     spy_ind = compute_indicators(spy_history)
     qqq_ind = compute_indicators(qqq_history)
     market = market_condition(spy_ind, qqq_ind)
+    analyzer = TechnicalZoneAnalyzer(period="2y")
 
     for ticker in tickers:
         symbol = ticker["symbol"]
         try:
-            history, info = fetch_history(symbol)
-            if history.empty:
-                failed.append({"symbol": symbol, "reason": "No price data returned"})
-                continue
-            ind = compute_indicators(history, spy_history)
-            pivots = detect_multi_timeframe_pivots(history)
-            fib_setup, fib_zones = calculate_recent_fib_zones(pivots)
-            sr_zones = calculate_sr_zones(pivots, fib_zones, ind)
-            buy_zone, target_zones = recommendation_zones(sr_zones, ind.get("price") or 0)
-            fib_extensions = calculate_fib_extensions(fib_setup.start_price, fib_setup.end_price) if fib_setup else {}
-            support, resistance = nearest_support_resistance(pivots, ind.get("price") or 0)
-            if support:
-                ind["support"] = support
-                ind["distance_to_support"] = (ind["price"] / support - 1) * 100 if ind.get("price") else None
-            if resistance:
-                ind["resistance"] = resistance
-                ind["distance_to_resistance"] = (resistance / ind["price"] - 1) * 100 if ind.get("price") else None
-            cache_pivots(ticker["id"], pivots)
-            cache_fib_zones(ticker["id"], fib_setup, fib_zones)
-            cache_sr_zones(ticker["id"], sr_zones)
+            with db() as conn:
+                signals = rows_to_dicts(
+                    conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at", (ticker["id"],)).fetchall()
+                )
+            analysis = analyzer.analyze(symbol, spy_history=spy_history, research_signals=signals)
+            history = analysis.history
+            info = analysis.info
+            ind = analysis.indicators
+            score = analysis.score
+            cache_pivots(ticker["id"], analysis.pivots)
+            cache_fib_zones(ticker["id"], analysis.fib_setup, analysis.fib_zones)
+            cache_sr_zones(ticker["id"], analysis.sr_zones)
             with db() as conn:
                 if info.get("company") or info.get("asset_type"):
                     conn.execute(
@@ -111,18 +93,6 @@ def refresh_all() -> dict:
                         ind.get("pattern_signal"),
                         None,
                     ),
-                )
-                signals = rows_to_dicts(
-                    conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at", (ticker["id"],)).fetchall()
-                )
-                score = score_ticker(
-                    ind,
-                    signals,
-                    zone_context={
-                        "buy_zone": buy_zone,
-                        "target_zones": target_zones,
-                        "fib_extensions": {"1.272": fib_extensions.get(1.272), "1.618": fib_extensions.get(1.618)},
-                    },
                 )
                 as_of = datetime.now(timezone.utc).isoformat()
                 conn.execute(

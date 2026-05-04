@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity,
@@ -98,6 +98,8 @@ type Dashboard = {
 };
 
 type Page = 'dashboard' | 'watchlists' | 'ticker' | 'research' | 'history' | 'learning' | 'settings';
+type DashboardFilter = 'all' | 'buy' | 'wait' | 'hold' | 'avoid' | 'close' | 'quality' | 'lower-risk' | 'news';
+type DashboardSort = 'score' | 'close' | 'quality' | 'risk' | 'ticker';
 
 type NewsItem = {
   id: number;
@@ -254,11 +256,34 @@ function NavButton({ page, current, setPage, icon, label }: { page: Page; curren
 
 function DashboardView({ cards, watchlists, news, showHelp, onSelect }: { cards: Card[]; watchlists: Watchlist[]; news: NewsItem[]; showHelp: boolean; onSelect: (symbol: string) => void }) {
   const [view, setView] = useState<'cards' | 'table'>('cards');
+  const [filter, setFilter] = useState<DashboardFilter>('all');
+  const [sort, setSort] = useState<DashboardSort>('score');
   const counts = {
     buy: cards.filter((c) => c.decision === 'Buy-worthy now').length,
     wait: cards.filter((c) => c.decision === 'Wait for better price').length,
     avoid: cards.filter((c) => c.decision === 'Avoid for now').length
   };
+  const filteredCards = useMemo(() => {
+    const riskRank: Record<string, number> = { Low: 1, Medium: 2, High: 3 };
+    const filtered = cards.filter((card) => {
+      if (filter === 'buy') return card.decision === 'Buy-worthy now';
+      if (filter === 'wait') return card.decision === 'Wait for better price';
+      if (filter === 'hold') return card.decision === 'Hold / no action';
+      if (filter === 'avoid') return card.decision === 'Avoid for now';
+      if (filter === 'close') return card.distance_to_buy_zone !== null && card.distance_to_buy_zone !== undefined && card.distance_to_buy_zone >= -2 && card.distance_to_buy_zone <= 5;
+      if (filter === 'quality') return (card.buy_zone_confluence || 0) >= 70 || (card.score || 0) >= 70;
+      if (filter === 'lower-risk') return card.risk === 'Low' || card.risk === 'Medium';
+      if (filter === 'news') return (card.news_count || 0) > 0;
+      return true;
+    });
+    return [...filtered].sort((a, b) => {
+      if (sort === 'close') return Math.abs(a.distance_to_buy_zone ?? 999) - Math.abs(b.distance_to_buy_zone ?? 999);
+      if (sort === 'quality') return (b.buy_zone_confluence || 0) - (a.buy_zone_confluence || 0);
+      if (sort === 'risk') return (riskRank[a.risk || 'High'] || 9) - (riskRank[b.risk || 'High'] || 9);
+      if (sort === 'ticker') return a.symbol.localeCompare(b.symbol);
+      return (b.score || 0) - (a.score || 0);
+    });
+  }, [cards, filter, sort]);
   return (
     <section className="stack">
       <div className="metric-grid">
@@ -282,12 +307,39 @@ function DashboardView({ cards, watchlists, news, showHelp, onSelect }: { cards:
         <span><b>Risk level</b> is the price that would weaken the setup.</span>
         <span><b>Targets</b> are review areas, not guarantees.</span>
       </div>
+      <div className="filter-bar">
+        <div className="filter-group">
+          <span>Show</span>
+          <select value={filter} onChange={(event) => setFilter(event.target.value as DashboardFilter)}>
+            <option value="all">All tickers</option>
+            <option value="buy">Buy-worthy now</option>
+            <option value="wait">Wait for better price</option>
+            <option value="hold">Hold / no action</option>
+            <option value="avoid">Avoid for now</option>
+            <option value="close">Close to buy area</option>
+            <option value="quality">Strong setup quality</option>
+            <option value="lower-risk">Low / medium risk</option>
+            <option value="news">Has news signal</option>
+          </select>
+        </div>
+        <div className="filter-group">
+          <span>Sort</span>
+          <select value={sort} onChange={(event) => setSort(event.target.value as DashboardSort)}>
+            <option value="score">Highest score</option>
+            <option value="close">Closest to buy area</option>
+            <option value="quality">Best setup quality</option>
+            <option value="risk">Lower risk first</option>
+            <option value="ticker">Ticker A-Z</option>
+          </select>
+        </div>
+        <span className="result-count">{filteredCards.length} of {cards.length} shown</span>
+      </div>
       {view === 'cards' ? (
         <div className="card-grid">
-          {cards.map((card) => <TickerCard key={card.symbol} card={card} showHelp={showHelp} onSelect={onSelect} />)}
+          {filteredCards.map((card) => <TickerCard key={card.symbol} card={card} showHelp={showHelp} onSelect={onSelect} />)}
         </div>
       ) : (
-        <RecommendationTable cards={cards} onSelect={onSelect} />
+        <RecommendationTable cards={filteredCards} onSelect={onSelect} />
       )}
       <div className="section-head"><h3>Free News Signals</h3><p>Headlines matched locally to your tickers</p></div>
       <NewsList items={news} compact />
@@ -325,7 +377,7 @@ function RecommendationTable({ cards, onSelect }: { cards: Card[]; onSelect: (sy
               </td>
               <td>{card.decision || 'Refresh needed'}</td>
               <td><span className={`score-mini ${scoreClass(card.score)}`}>{card.score ?? '--'}</span></td>
-              <td>{card.price ? `$${card.price.toFixed(2)}` : '--'}</td>
+              <td><span className="table-price">{card.price ? `$${card.price.toFixed(2)}` : '--'}</span></td>
               <td>{card.risk || '--'}</td>
               <td>{card.news_count ? `${card.news_count} headline${card.news_count === 1 ? '' : 's'}` : 'No match'}</td>
               <td>{card.entry_range || '--'}</td>
@@ -357,6 +409,44 @@ function PriceLine({ label, value, help, showHelp }: { label: string; value: str
   );
 }
 
+function technicalSourceToPlain(label: string) {
+  return label
+    .replace(/daily swing low/gi, 'recent buyer area')
+    .replace(/weekly swing low/gi, 'major buyer area')
+    .replace(/daily swing high/gi, 'recent hesitation area')
+    .replace(/weekly swing high/gi, 'major hesitation area')
+    .replace(/Golden Zone/gi, 'value area')
+    .replace(/50-day moving average/gi, '50-day average')
+    .replace(/200-day moving average/gi, '200-day average')
+    .replace(/Fib/gi, 'price retracement');
+}
+
+function plainZoneReason(card: Card) {
+  const supportSources = card.nearest_support_zone?.sources ?? [];
+  const labels = supportSources
+    .map((source) => technicalSourceToPlain(source.label))
+    .filter(Boolean);
+  const uniqueLabels = Array.from(new Set(labels)).slice(0, 3);
+  if (uniqueLabels.length) return `This area is based on ${uniqueLabels.join(' + ')}.`;
+  if (card.buy_zone_explanation) return technicalSourceToPlain(card.buy_zone_explanation);
+  return 'This area is based on recent price behavior and longer-term averages.';
+}
+
+function decisionNudge(card: Card) {
+  const distance = card.distance_to_buy_zone;
+  if (distance === null || distance === undefined) return card.summary || 'Run a refresh to calculate this setup.';
+  if (distance > 8) {
+    return `Price is ${distance.toFixed(1)}% above the preferred buy area, so patience may reduce risk.`;
+  }
+  if (distance > 3) {
+    return `Price is ${distance.toFixed(1)}% above the preferred buy area. It is close enough to watch, but not an urgent buy.`;
+  }
+  if (distance >= -2) {
+    return 'Price is near the preferred buy area. Review the score, risk, and your portfolio fit before acting.';
+  }
+  return 'Price is below the preferred buy area. That can mean a discount, but also check whether the setup is weakening.';
+}
+
 function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolean; onSelect: (symbol: string) => void }) {
   return (
     <article className="ticker-card" onClick={() => onSelect(card.symbol)}>
@@ -370,39 +460,69 @@ function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolea
       <div className="decision">{card.decision || 'Refresh needed'}</div>
       <p className="summary">{card.summary || 'Run a refresh to calculate this setup.'}</p>
       <div className="facts">
-        <span>Price <b>{card.price ? `$${card.price.toFixed(2)}` : '--'}</b></span>
+        <span className="price-chip">Current price <b>{card.price ? `$${card.price.toFixed(2)}` : '--'}</b></span>
         <span>Risk <b>{card.risk || '--'}</b></span>
         <span>Confidence <b>{card.confidence || '--'}</b></span>
         <span>News <b>{card.news_count || 0}</b></span>
-        {card.buy_zone_confluence ? <span>Zone <b>{Math.round(card.buy_zone_confluence)}/100</b></span> : null}
+        {card.buy_zone_confluence ? (
+          <span>
+            Setup quality <b>{Math.round(card.buy_zone_confluence)}/100</b>
+            {showHelp && <HelpIcon text="How many useful price clues agree near the preferred buy area. Higher means the area is more clearly supported by the data; it still does not guarantee the trade works." />}
+          </span>
+        ) : null}
       </div>
       {card.latest_news_title && (
         <a className="news-teaser" href={card.latest_news_link} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
           {card.latest_news_source}: {card.latest_news_title}
         </a>
       )}
-      <div className="plain-list">
-        {card.distance_to_buy_zone !== null && card.distance_to_buy_zone !== undefined && (
-          <span>Distance to buy zone: {card.distance_to_buy_zone.toFixed(1)}%</span>
-        )}
-        {card.buy_zone_explanation && (
-          <span>Buy zone basis: {card.buy_zone_explanation}</span>
-        )}
-        {card.target_zone_explanation && (
-          <span>Target basis: {card.target_zone_explanation}</span>
-        )}
-        {card.nearest_support_zone && (
-          <span>Demand zone: {card.nearest_support_zone.plain_english}</span>
-        )}
-        {card.nearest_resistance_zone && (
-          <span>Supply zone: {card.nearest_resistance_zone.plain_english}</span>
-        )}
-        <PriceLine label="Pivot support" value={card.support ? `$${card.support.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown buyers may step in around here. It is not a guaranteed floor." />
-        <PriceLine label="Pivot resistance" value={card.resistance ? `$${card.resistance.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown sellers or hesitation may appear around here." />
-        <PriceLine label="Buy zone" value={card.entry_range || '--'} showHelp={showHelp} help="A price area where the setup may offer cleaner risk/reward. It is not a command to buy." />
-        <PriceLine label="Risk level" value={card.invalidation_level || '--'} showHelp={showHelp} help="If price falls below this area and stays weak, the setup may be breaking down." />
-        <PriceLine label="Review targets" value={`${card.target1 || '--'} / ${card.target2 || '--'}`} showHelp={showHelp} help="Price areas to reassess, not automatic sell points and not guarantees." />
+      <div className="decision-plan">
+        <div className="plan-row current">
+          <span className="plan-label">Right now</span>
+          <span className="plan-value">{card.decision || 'Refresh needed'}</span>
+        </div>
+        <div className="plan-row">
+          <span className="plan-label">
+            Preferred buy area
+            {showHelp && <HelpIcon text="A calmer price area to consider a new buy. It is not a command to buy." />}
+          </span>
+          <span className="plan-value">{card.entry_range || '--'}</span>
+        </div>
+        <div className="plan-row">
+          <span className="plan-label">
+            Review area
+            {showHelp && <HelpIcon text="A price area to reassess. It is not an automatic sell point and not a guarantee." />}
+          </span>
+          <span className="plan-value">{card.target1 || '--'} / {card.target2 || '--'}</span>
+        </div>
+        <div className="plan-row">
+          <span className="plan-label">
+            Risk line
+            {showHelp && <HelpIcon text="If price falls below this area and stays weak, the setup may be breaking down." />}
+          </span>
+          <span className="plan-value">{card.invalidation_level || '--'}</span>
+        </div>
       </div>
+      <div className="simple-note">
+        <b>Why this action:</b> {decisionNudge(card)}
+        <span>{plainZoneReason(card)}</span>
+      </div>
+      <details className="technical-details" onClick={(event) => event.stopPropagation()}>
+        <summary>Show learning details</summary>
+        <div className="plain-list">
+          {card.distance_to_buy_zone !== null && card.distance_to_buy_zone !== undefined && (
+            <span>Distance to preferred buy area: {card.distance_to_buy_zone.toFixed(1)}%</span>
+          )}
+          {card.nearest_support_zone && (
+            <PriceLine label="Buyer area" value={`$${card.nearest_support_zone.price_low.toFixed(2)} - $${card.nearest_support_zone.price_high.toFixed(2)}`} showHelp={showHelp} help="A price range where the app found evidence buyers may become more interested. This is used in the backend to shape the preferred buy area." />
+          )}
+          {card.nearest_resistance_zone && (
+            <PriceLine label="Hesitation area" value={`$${card.nearest_resistance_zone.price_low.toFixed(2)} - $${card.nearest_resistance_zone.price_high.toFixed(2)}`} showHelp={showHelp} help="A price range where the app found evidence sellers or hesitation may appear. This is used in the backend to shape review areas." />
+          )}
+          <PriceLine label="Pivot support" value={card.support ? `$${card.support.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown buyers may step in around here. It is not a guaranteed floor." />
+          <PriceLine label="Pivot resistance" value={card.resistance ? `$${card.resistance.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown sellers or hesitation may appear around here." />
+        </div>
+      </details>
     </article>
   );
 }
@@ -458,6 +578,43 @@ function WatchlistSummary({ watchlist }: { watchlist: Watchlist }) {
 
 function Metric({ label, value }: { label: string; value: number }) {
   return <div className="metric"><p>{label}</p><strong>{value}</strong></div>;
+}
+
+function formatMoney(value?: number | string | null) {
+  if (value === null || value === undefined || value === '') return '--';
+  if (typeof value === 'string') return value.startsWith('$') ? value : value;
+  return `$${value.toFixed(2)}`;
+}
+
+function formatNumber(value?: number | null, digits = 2) {
+  if (value === null || value === undefined) return '--';
+  return value.toFixed(digits);
+}
+
+function DetailStat({ label, value, tone }: { label: string; value?: React.ReactNode; tone?: string }) {
+  return (
+    <div className={tone ? `detail-stat ${tone}` : 'detail-stat'}>
+      <span>{label}</span>
+      <b>{value || '--'}</b>
+    </div>
+  );
+}
+
+function ZoneList({ zones }: { zones: SRZone[] }) {
+  if (!zones?.length) return <p>No support/resistance zones cached yet. Run Refresh after adding the ticker.</p>;
+  return (
+    <div className="zone-list">
+      {zones.slice(0, 6).map((zone, index) => (
+        <div className="zone-row" key={`${zone.zone_type}-${zone.price_low}-${index}`}>
+          <div>
+            <b>{zone.zone_type === 'support' ? 'Buyer area' : 'Review area'}</b>
+            <span>{formatMoney(zone.price_low)} - {formatMoney(zone.price_high)}</span>
+          </div>
+          <span className="score-mini good">{Math.round(zone.confluence_score)}</span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function WatchlistsView({ reload }: { reload: () => Promise<void> }) {
@@ -566,6 +723,10 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (symbol:
 
   useEffect(() => { load(symbol); }, [symbol]);
   const score = detail?.scores?.[0];
+  const indicators = detail?.indicators;
+  const zones = (detail?.sr_zones || []) as SRZone[];
+  const buyerZones = zones.filter((zone) => zone.zone_type === 'support');
+  const reviewZones = zones.filter((zone) => zone.zone_type === 'resistance');
 
   return (
     <section className="stack">
@@ -580,9 +741,36 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (symbol:
             <div>
               <p className="eyebrow">{detail.ticker.theme}</p>
               <h2>{detail.ticker.symbol} {detail.ticker.company ? `· ${detail.ticker.company}` : ''}</h2>
-              <p>{score?.summary || 'Refresh data to calculate this setup.'}</p>
+              <p>{decisionNudge({ ...score, price: indicators?.price } as Card)}</p>
             </div>
             <div className={`score large ${scoreClass(score?.score)}`}>{score?.score ?? '--'}</div>
+          </div>
+          <div className="detail-grid">
+            <article className="panel compact">
+              <div className="row">
+                <h3>Decision Plan</h3>
+                <span className="pill">{score?.decision || 'Refresh needed'}</span>
+              </div>
+              <div className="detail-stat-grid">
+                <DetailStat label="Current price" value={formatMoney(indicators?.price)} tone="price" />
+                <DetailStat label="Preferred buy area" value={score?.entry_range} />
+                <DetailStat label="Review area" value={`${score?.target1 || '--'} / ${score?.target2 || '--'}`} />
+                <DetailStat label="Risk line" value={score?.invalidation_level} />
+                <DetailStat label="Distance to buy area" value={score?.distance_to_buy_zone !== null && score?.distance_to_buy_zone !== undefined ? `${score.distance_to_buy_zone.toFixed(1)}%` : '--'} />
+                <DetailStat label="Setup quality" value={score?.buy_zone_confluence ? `${Math.round(score.buy_zone_confluence)}/100` : '--'} />
+              </div>
+            </article>
+            <article className="panel compact">
+              <h3>Signal Health</h3>
+              <div className="detail-stat-grid">
+                <DetailStat label="Trend" value={score?.trend_label} />
+                <DetailStat label="Momentum" value={score?.momentum_label} />
+                <DetailStat label="Volume" value={score?.volume_label} />
+                <DetailStat label="News / research" value={score?.news_label} />
+                <DetailStat label="Risk" value={score?.risk} />
+                <DetailStat label="Confidence" value={score?.confidence} />
+              </div>
+            </article>
           </div>
           <div className="chart-panel">
             <ResponsiveContainer width="100%" height={280}>
@@ -594,11 +782,69 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (symbol:
               </ReLineChart>
             </ResponsiveContainer>
           </div>
-        <div className="info-grid">
+          <div className="detail-grid">
+            <article className="panel compact">
+              <h3>Key Price Areas</h3>
+              <div className="detail-stat-grid">
+                <DetailStat label="Pivot support" value={formatMoney(indicators?.support)} />
+                <DetailStat label="Pivot resistance" value={formatMoney(indicators?.resistance)} />
+                <DetailStat label="50-day average" value={formatMoney(indicators?.ma50)} />
+                <DetailStat label="200-day average" value={formatMoney(indicators?.ma200)} />
+                <DetailStat label="ATR risk buffer" value={formatMoney(indicators?.atr)} />
+                <DetailStat label="Relative strength vs SPY" value={formatNumber(indicators?.relative_strength, 3)} />
+              </div>
+            </article>
+            <article className="panel compact">
+              <h3>Buyer Areas</h3>
+              <ZoneList zones={buyerZones} />
+            </article>
+            <article className="panel compact">
+              <h3>Review Areas</h3>
+              <ZoneList zones={reviewZones} />
+            </article>
+            <article className="panel compact">
+              <h3>Recent Signals</h3>
+              <div className="detail-stat-grid">
+                <DetailStat label="RSI" value={formatNumber(indicators?.rsi, 1)} />
+                <DetailStat label="Volume vs average" value={indicators?.volume_ratio ? `${formatNumber(indicators.volume_ratio, 2)}x` : '--'} />
+                <DetailStat label="Pattern" value={indicators?.pattern_signal} />
+                <DetailStat label="Data date" value={indicators?.as_of} />
+              </div>
+            </article>
+          </div>
+          <div className="info-grid">
             <Info title="Suggested action" body={score?.suggested_action} />
             <Info title="Why this rating" body={score?.why_rating} />
             <Info title="What changes the view" body={score?.changes_view} />
             <Info title="Hold window" body={score?.hold_window} />
+          </div>
+          <div className="detail-grid">
+            <article className="panel compact">
+              <h3>Recommendation Memory</h3>
+              <div className="mini-table">
+                {(detail.recommendations || []).slice(0, 5).map((item: any) => (
+                  <div className="mini-row" key={item.id}>
+                    <b>{item.decision}</b>
+                    <span>{formatMoney(item.price)} · score {item.score}</span>
+                    <span>{item.created_at?.slice(0, 10)}</span>
+                  </div>
+                ))}
+                {!(detail.recommendations || []).length && <p>No recommendation history yet.</p>}
+              </div>
+            </article>
+            <article className="panel compact">
+              <h3>Research Signals</h3>
+              <div className="mini-table">
+                {(detail.research || []).slice(0, 5).map((item: any) => (
+                  <div className="mini-row" key={item.id}>
+                    <b>{item.sentiment || 'Signal'} · {item.confidence || 'Confidence --'}</b>
+                    <span>{item.catalyst_type || item.suggested_impact || 'Research note'}</span>
+                    <span>{item.source_date || item.created_at?.slice(0, 10)}</span>
+                  </div>
+                ))}
+                {!(detail.research || []).length && <p>No pasted research signals yet.</p>}
+              </div>
+            </article>
           </div>
           <div className="section-head"><h3>Matched RSS Headlines</h3><p>Free sources, local matching only</p></div>
           <NewsList items={detail.news || []} ticker={detail.ticker.symbol} onApplied={() => load(detail.ticker.symbol)} />
