@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { ColorType, createChart, LineSeries, LineStyle } from 'lightweight-charts';
 import {
   Activity,
   BookOpen,
@@ -17,14 +18,6 @@ import {
   Target,
   Trash2
 } from 'lucide-react';
-import {
-  Line,
-  LineChart as ReLineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis
-} from 'recharts';
 import './styles.css';
 
 const API = '';
@@ -48,6 +41,28 @@ type Card = {
   risk?: string;
   trend_label?: string;
   momentum_label?: string;
+  momentum_summary?: string;
+  momentum_score?: number;
+  rsi?: number;
+  rsi_interpretation?: string;
+  macd?: number;
+  macd_signal?: number;
+  macd_histogram?: number;
+  macd_trend?: string;
+  indicator_macd_trend?: string;
+  momentum_divergence?: string;
+  adx?: number;
+  adx_interpretation?: string;
+  trend_alignment?: string;
+  trend_strength_score?: number;
+  trend_strength_summary?: string;
+  score_trend_strength_summary?: string;
+  obv_trend?: string;
+  volume_vs_20d?: number;
+  rising_volume_on_up_days?: number;
+  volume_confirmation?: string;
+  volume_confirmation_summary?: string;
+  score_volume_confirmation_summary?: string;
   volume_label?: string;
   news_label?: string;
   summary?: string;
@@ -58,6 +73,12 @@ type Card = {
   target2?: string;
   distance_to_buy_zone?: number;
   buy_zone_confluence?: number;
+  setup_factor_scores?: SetupFactor[];
+  setup_positive_factors?: string[];
+  setup_concern_factors?: string[];
+  decision_reasons?: string[];
+  risk_reward_summary?: string;
+  improve_to_buy?: string;
   buy_zone_explanation?: string;
   target_zone_explanation?: string;
   hold_window?: string;
@@ -71,6 +92,15 @@ type Card = {
   latest_news_link?: string;
   nearest_support_zone?: SRZone | null;
   nearest_resistance_zone?: SRZone | null;
+};
+
+type SetupFactor = {
+  key: string;
+  label: string;
+  score: number;
+  weight: number;
+  positive?: string;
+  concern?: string;
 };
 
 type Watchlist = {
@@ -447,6 +477,52 @@ function decisionNudge(card: Card) {
   return 'Price is below the preferred buy area. That can mean a discount, but also check whether the setup is weakening.';
 }
 
+function plainFactor(text?: string) {
+  if (!text) return '';
+  return text
+    .replace(/Momentum is supportive: RSI [\d.]+, Bullish/gi, 'Momentum is supportive')
+    .replace(/RSI [\d.]+ is bullish; MACD is supportive\./gi, 'Buying pressure is positive.')
+    .replace(/RSI cools below \d+/gi, 'momentum cools')
+    .replace(/Trend is acceptable: Daily & weekly aligned/gi, 'Short-term and longer-term trends agree')
+    .replace(/Daily & weekly aligned/gi, 'short-term and longer-term trends agree')
+    .replace(/Weak trend \([\d.]+ ADX\)/gi, 'Trend is not forceful yet')
+    .replace(/Strong trend \([\d.]+ ADX\)/gi, 'Trend has strong follow-through')
+    .replace(/Very strong trend \([\d.]+ ADX\)/gi, 'Trend has very strong follow-through')
+    .replace(/Bollinger range is wide at [\d.]+%/gi, 'Price is moving in a wide range')
+    .replace(/Quiet \([\d.]+x 20-day average, not clearly rising on up days\)\./gi, 'Volume is quiet, so buying interest is not loud yet.')
+    .replace(/Constructive \([\d.]+x 20-day average, rising on up days\)\./gi, 'Volume is constructive.')
+    .replace(/Supportive \([\d.]+x 20-day average, rising on up days\)\./gi, 'Volume supports the move.')
+    .replace(/preferred buy area/g, 'preferred buy area');
+}
+
+function signalTone(label?: string) {
+  const value = (label || '').toLowerCase();
+  if (['strong', 'good', 'supportive', 'constructive', 'low'].some((word) => value.includes(word))) return 'green';
+  if (['mixed', 'neutral', 'medium', 'developing'].some((word) => value.includes(word))) return 'yellow';
+  if (['weak', 'high', 'falling', 'quiet'].some((word) => value.includes(word))) return 'red';
+  return 'yellow';
+}
+
+function SignalHealthGrid({ card }: { card: Card }) {
+  const signals = [
+    { label: 'Trend', value: card.trend_label || '--' },
+    { label: 'Momentum', value: card.momentum_label || '--' },
+    { label: 'Volume', value: card.volume_label || '--' },
+    { label: 'Risk', value: card.risk || '--' }
+  ];
+  return (
+    <div className="signal-health-grid">
+      {signals.map((signal) => (
+        <span className={`signal-pill ${signalTone(signal.value)}`} key={signal.label}>
+          <i aria-hidden="true" />
+          <b>{signal.label}</b>
+          {signal.value}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolean; onSelect: (symbol: string) => void }) {
   return (
     <article className="ticker-card" onClick={() => onSelect(card.symbol)}>
@@ -458,16 +534,15 @@ function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolea
         <div className={`score ${scoreClass(card.score)}`}>{card.score ?? '--'}</div>
       </div>
       <div className="decision">{card.decision || 'Refresh needed'}</div>
-      <p className="summary">{card.summary || 'Run a refresh to calculate this setup.'}</p>
+      <p className="summary">{decisionNudge(card)}</p>
       <div className="facts">
         <span className="price-chip">Current price <b>{card.price ? `$${card.price.toFixed(2)}` : '--'}</b></span>
-        <span>Risk <b>{card.risk || '--'}</b></span>
         <span>Confidence <b>{card.confidence || '--'}</b></span>
         <span>News <b>{card.news_count || 0}</b></span>
         {card.buy_zone_confluence ? (
           <span>
             Setup quality <b>{Math.round(card.buy_zone_confluence)}/100</b>
-            {showHelp && <HelpIcon text="How many useful price clues agree near the preferred buy area. Higher means the area is more clearly supported by the data; it still does not guarantee the trade works." />}
+            {showHelp && <HelpIcon text="Weighted checklist score: price zones 30%, trend 25%, momentum 20%, volume 15%, volatility 10%. Higher is cleaner, not guaranteed." />}
           </span>
         ) : null}
       </div>
@@ -476,11 +551,8 @@ function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolea
           {card.latest_news_source}: {card.latest_news_title}
         </a>
       )}
+      <SignalHealthGrid card={card} />
       <div className="decision-plan">
-        <div className="plan-row current">
-          <span className="plan-label">Right now</span>
-          <span className="plan-value">{card.decision || 'Refresh needed'}</span>
-        </div>
         <div className="plan-row">
           <span className="plan-label">
             Preferred buy area
@@ -503,26 +575,11 @@ function TickerCard({ card, showHelp, onSelect }: { card: Card; showHelp: boolea
           <span className="plan-value">{card.invalidation_level || '--'}</span>
         </div>
       </div>
-      <div className="simple-note">
-        <b>Why this action:</b> {decisionNudge(card)}
-        <span>{plainZoneReason(card)}</span>
+      <div className="card-scan">
+        <span><b>Best point:</b> {plainFactor((card.decision_reasons || card.setup_positive_factors || [])[0]) || 'Setup has enough evidence to review.'}</span>
+        {(card.setup_concern_factors || [])[0] && <span><b>Watch:</b> {plainFactor(card.setup_concern_factors?.[0])}</span>}
+        <span className="open-detail">Click for the full checklist and learning details</span>
       </div>
-      <details className="technical-details" onClick={(event) => event.stopPropagation()}>
-        <summary>Show learning details</summary>
-        <div className="plain-list">
-          {card.distance_to_buy_zone !== null && card.distance_to_buy_zone !== undefined && (
-            <span>Distance to preferred buy area: {card.distance_to_buy_zone.toFixed(1)}%</span>
-          )}
-          {card.nearest_support_zone && (
-            <PriceLine label="Buyer area" value={`$${card.nearest_support_zone.price_low.toFixed(2)} - $${card.nearest_support_zone.price_high.toFixed(2)}`} showHelp={showHelp} help="A price range where the app found evidence buyers may become more interested. This is used in the backend to shape the preferred buy area." />
-          )}
-          {card.nearest_resistance_zone && (
-            <PriceLine label="Hesitation area" value={`$${card.nearest_resistance_zone.price_low.toFixed(2)} - $${card.nearest_resistance_zone.price_high.toFixed(2)}`} showHelp={showHelp} help="A price range where the app found evidence sellers or hesitation may appear. This is used in the backend to shape review areas." />
-          )}
-          <PriceLine label="Pivot support" value={card.support ? `$${card.support.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown buyers may step in around here. It is not a guaranteed floor." />
-          <PriceLine label="Pivot resistance" value={card.resistance ? `$${card.resistance.toFixed(2)}` : '--'} showHelp={showHelp} help="Price has shown sellers or hesitation may appear around here." />
-        </div>
-      </details>
     </article>
   );
 }
@@ -591,6 +648,20 @@ function formatNumber(value?: number | null, digits = 2) {
   return value.toFixed(digits);
 }
 
+function parseMoneyValue(value?: string | number | null) {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'number') return value;
+  const match = value.match(/-?\$?([\d,]+(?:\.\d+)?)/);
+  return match ? Number(match[1].replace(/,/g, '')) : undefined;
+}
+
+function parseMoneyRange(value?: string | null) {
+  if (!value) return undefined;
+  const matches = [...value.matchAll(/-?\$?([\d,]+(?:\.\d+)?)/g)].map((match) => Number(match[1].replace(/,/g, '')));
+  if (matches.length < 2) return undefined;
+  return { low: Math.min(matches[0], matches[1]), high: Math.max(matches[0], matches[1]) };
+}
+
 function DetailStat({ label, value, tone }: { label: string; value?: React.ReactNode; tone?: string }) {
   return (
     <div className={tone ? `detail-stat ${tone}` : 'detail-stat'}>
@@ -614,6 +685,222 @@ function ZoneList({ zones }: { zones: SRZone[] }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function PriceChart({
+  prices,
+  score,
+  indicators
+}: {
+  prices: Array<{ date: string; close: number; volume?: number }>;
+  score: any;
+  indicators: any;
+}) {
+  const chartContainerRef = useRef<HTMLDivElement | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const buyRange = parseMoneyRange(score?.entry_range);
+  const riskLine = parseMoneyValue(score?.invalidation_level);
+  const target1 = parseMoneyValue(score?.target1);
+  const target2 = parseMoneyValue(score?.target2);
+  const currentPrice = indicators?.price;
+  const firstTarget = target1 && currentPrice && target1 > currentPrice ? target1 : undefined;
+  const secondTarget = target2 && currentPrice && target2 > currentPrice && target2 !== firstTarget ? target2 : undefined;
+  const chartData = useMemo(
+    () => prices
+      .filter((item) => item.date && typeof item.close === 'number')
+      .map((item) => ({ time: item.date, value: Number(item.close) })),
+    [prices]
+  );
+
+  useEffect(() => {
+    const container = chartContainerRef.current;
+    if (!container || !chartData.length) return;
+
+    container.replaceChildren();
+    const chart = createChart(container, {
+      height: 430,
+      autoSize: true,
+      layout: {
+        background: { type: ColorType.Solid, color: '#ffffff' },
+        textColor: '#52615b',
+        fontFamily: 'Inter, system-ui, sans-serif'
+      },
+      grid: {
+        vertLines: { color: '#f1f4f2' },
+        horzLines: { color: '#e7ece9' }
+      },
+      rightPriceScale: {
+        borderColor: '#d8e1dc',
+        scaleMargins: { top: 0.12, bottom: 0.16 }
+      },
+      timeScale: {
+        borderColor: '#d8e1dc',
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 10,
+        barSpacing: 7
+      },
+      crosshair: {
+        mode: 1,
+        horzLine: { labelVisible: true },
+        vertLine: { labelVisible: true }
+      },
+      handleScroll: {
+        mouseWheel: true,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: false
+      },
+      handleScale: {
+        axisPressedMouseMove: true,
+        mouseWheel: true,
+        pinch: true
+      }
+    });
+
+    const priceSeries = chart.addSeries(LineSeries, {
+      color: '#172126',
+      lineWidth: 3,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      crosshairMarkerVisible: true,
+      crosshairMarkerRadius: 5
+    });
+    priceSeries.setData(chartData as any);
+
+    if (buyRange) {
+      priceSeries.createPriceLine({
+        price: buyRange.high,
+        color: '#167540',
+        lineWidth: 2,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `Buy high $${buyRange.high.toFixed(2)}`
+      });
+      priceSeries.createPriceLine({
+        price: buyRange.low,
+        color: '#167540',
+        lineWidth: 2,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `Buy low $${buyRange.low.toFixed(2)}`
+      });
+    }
+    if (currentPrice) {
+      priceSeries.createPriceLine({
+        price: currentPrice,
+        color: '#246bfe',
+        lineWidth: 3,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `Current $${currentPrice.toFixed(2)}`
+      });
+    }
+    if (riskLine) {
+      priceSeries.createPriceLine({
+        price: riskLine,
+        color: '#a93624',
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `Risk $${riskLine.toFixed(2)}`
+      });
+    }
+    if (firstTarget) {
+      priceSeries.createPriceLine({
+        price: firstTarget,
+        color: '#915d05',
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `Review 1 $${firstTarget.toFixed(2)}`
+      });
+    }
+    if (secondTarget) {
+      priceSeries.createPriceLine({
+        price: secondTarget,
+        color: '#915d05',
+        lineWidth: 1,
+        lineStyle: LineStyle.LargeDashed,
+        axisLabelVisible: true,
+        title: `Review 2 $${secondTarget.toFixed(2)}`
+      });
+    }
+
+    chart.timeScale().fitContent();
+    const tooltip = tooltipRef.current;
+    chart.subscribeCrosshairMove((param) => {
+      if (!tooltip || !param.point || !param.time || param.point.x < 0 || param.point.y < 0) {
+        if (tooltip) tooltip.style.display = 'none';
+        return;
+      }
+      const data = param.seriesData.get(priceSeries) as { value?: number } | undefined;
+      if (!data?.value) {
+        tooltip.style.display = 'none';
+        return;
+      }
+      tooltip.style.display = 'block';
+      tooltip.style.left = `${Math.min(param.point.x + 14, container.clientWidth - 170)}px`;
+      tooltip.style.top = `${Math.max(param.point.y - 48, 8)}px`;
+      tooltip.innerHTML = `<b>${String(param.time)}</b><span>$${data.value.toFixed(2)}</span>`;
+    });
+
+    const resizeObserver = new ResizeObserver(() => {
+      chart.applyOptions({ width: container.clientWidth });
+    });
+    resizeObserver.observe(container);
+
+    (container as any).__ktradeChart = chart;
+    return () => {
+      resizeObserver.disconnect();
+      chart.remove();
+    };
+  }, [chartData, buyRange?.high, buyRange?.low, currentPrice, riskLine, firstTarget, secondTarget]);
+
+  const setRange = (bars: number | 'all') => {
+    const chart = (chartContainerRef.current as any)?.__ktradeChart;
+    if (!chart || !chartData.length) return;
+    if (bars === 'all') {
+      chart.timeScale().fitContent();
+      return;
+    }
+    chart.timeScale().setVisibleLogicalRange({
+      from: Math.max(0, chartData.length - bars),
+      to: chartData.length + 8
+    });
+  };
+
+  return (
+    <article className="chart-panel rich-chart">
+      <div className="chart-head">
+        <div>
+          <h3>Interactive Price Map</h3>
+          <p>Scroll to zoom, drag to pan, and read the key prices on the right axis.</p>
+        </div>
+        <div className="chart-controls">
+          <button onClick={() => setRange(65)}>3M</button>
+          <button onClick={() => setRange(130)}>6M</button>
+          <button onClick={() => setRange(260)}>1Y</button>
+          <button onClick={() => setRange('all')}>All</button>
+        </div>
+      </div>
+      <div className="tv-chart-shell">
+        <div className="tv-chart" ref={chartContainerRef} />
+        <div className="tv-tooltip" ref={tooltipRef} />
+      </div>
+      <div className="chart-legend">
+        <span><i className="legend-current" />Current price line</span>
+        <span><i className="legend-buy" />Buy low / buy high</span>
+        <span><i className="legend-risk" />Risk line</span>
+        <span><i className="legend-review" />Review targets</span>
+      </div>
+      <div className="chart-read">
+        <span><b>Decision read:</b> {decisionNudge({ ...score, price: currentPrice } as Card)}</span>
+        {buyRange && <span><b>Buy area:</b> Use the green price labels on the right as the lower and upper edges of the calmer buy area.</span>}
+        {riskLine && <span><b>Risk:</b> A weak move below the red price label would damage the setup.</span>}
+      </div>
+    </article>
   );
 }
 
@@ -762,26 +1049,52 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (symbol:
             </article>
             <article className="panel compact">
               <h3>Signal Health</h3>
+              <SignalHealthGrid card={{ ...score, risk: score?.risk } as Card} />
               <div className="detail-stat-grid">
-                <DetailStat label="Trend" value={score?.trend_label} />
+                <DetailStat label="Trend" value={score?.trend_strength_summary || indicators?.trend_strength_summary || score?.trend_label} />
                 <DetailStat label="Momentum" value={score?.momentum_label} />
-                <DetailStat label="Volume" value={score?.volume_label} />
+                <DetailStat label="Momentum read" value={score?.momentum_summary || indicators?.momentum_summary} />
+                <DetailStat label="Volume" value={score?.volume_confirmation_summary || indicators?.volume_confirmation_summary || score?.volume_label} />
                 <DetailStat label="News / research" value={score?.news_label} />
                 <DetailStat label="Risk" value={score?.risk} />
                 <DetailStat label="Confidence" value={score?.confidence} />
               </div>
             </article>
+            <article className="panel compact">
+              <h3>Why This Action</h3>
+              <p>{decisionNudge({ ...score, price: indicators?.price } as Card)}</p>
+              <div className="factor-list positive">
+                <b>Top 3 reasons</b>
+                {((score?.decision_reasons || score?.setup_positive_factors || []) as string[]).slice(0, 3).map((factor) => (
+                  <span key={factor}>{plainFactor(factor)}</span>
+                ))}
+              </div>
+              {(score?.setup_concern_factors || []).length ? (
+                <div className="factor-list concern">
+                  <b>Concerns</b>
+                  {((score?.setup_concern_factors || []) as string[]).slice(0, 2).map((factor) => (
+                    <span key={factor}>{plainFactor(factor)}</span>
+                  ))}
+                </div>
+              ) : null}
+            </article>
+            <article className="panel compact">
+              <h3>Setup Checklist</h3>
+              <div className="checklist-bars">
+                {((score?.setup_factor_scores || []) as SetupFactor[]).map((factor) => (
+                  <div className="checklist-row" key={factor.key}>
+                    <div className="row">
+                      <span>{factor.label}</span>
+                      <b>{Math.round(factor.score)}/100</b>
+                    </div>
+                    <div className="bar"><span style={{ width: `${Math.max(0, Math.min(100, factor.score))}%` }} /></div>
+                  </div>
+                ))}
+                {!(score?.setup_factor_scores || []).length && <p>Refresh this ticker to calculate checklist factors.</p>}
+              </div>
+            </article>
           </div>
-          <div className="chart-panel">
-            <ResponsiveContainer width="100%" height={280}>
-              <ReLineChart data={detail.prices}>
-                <XAxis dataKey="date" minTickGap={28} />
-                <YAxis domain={['auto', 'auto']} />
-                <Tooltip />
-                <Line type="monotone" dataKey="close" stroke="#246bfe" dot={false} strokeWidth={2} />
-              </ReLineChart>
-            </ResponsiveContainer>
-          </div>
+          <PriceChart prices={detail.prices} score={score} indicators={indicators} />
           <div className="detail-grid">
             <article className="panel compact">
               <h3>Key Price Areas</h3>
@@ -806,7 +1119,17 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (symbol:
               <h3>Recent Signals</h3>
               <div className="detail-stat-grid">
                 <DetailStat label="RSI" value={formatNumber(indicators?.rsi, 1)} />
-                <DetailStat label="Volume vs average" value={indicators?.volume_ratio ? `${formatNumber(indicators.volume_ratio, 2)}x` : '--'} />
+                <DetailStat label="RSI read" value={indicators?.rsi_interpretation} />
+                <DetailStat label="ADX trend strength" value={indicators?.adx ? `${formatNumber(indicators.adx, 1)} · ${indicators.adx_interpretation}` : '--'} />
+                <DetailStat label="Daily / weekly trend" value={indicators?.trend_alignment} />
+                <DetailStat label="MACD" value={formatNumber(indicators?.macd, 2)} />
+                <DetailStat label="MACD signal" value={formatNumber(indicators?.macd_signal, 2)} />
+                <DetailStat label="MACD histogram" value={formatNumber(indicators?.macd_histogram, 2)} />
+                <DetailStat label="MACD trend" value={indicators?.macd_trend || score?.macd_trend} />
+                <DetailStat label="Divergence" value={indicators?.momentum_divergence || 'None detected'} />
+                <DetailStat label="Volume vs 20-day avg" value={indicators?.volume_vs_20d ? `${formatNumber(indicators.volume_vs_20d, 2)}x` : '--'} />
+                <DetailStat label="OBV trend" value={indicators?.obv_trend} />
+                <DetailStat label="Up-day volume" value={indicators?.rising_volume_on_up_days ? 'Rising on advances' : 'Not clearly rising'} />
                 <DetailStat label="Pattern" value={indicators?.pattern_signal} />
                 <DetailStat label="Data date" value={indicators?.as_of} />
               </div>
@@ -815,6 +1138,8 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (symbol:
           <div className="info-grid">
             <Info title="Suggested action" body={score?.suggested_action} />
             <Info title="Why this rating" body={score?.why_rating} />
+            <Info title="Risk / reward at buy area" body={score?.risk_reward_summary} />
+            <Info title="What would improve this" body={plainFactor(score?.improve_to_buy)} />
             <Info title="What changes the view" body={score?.changes_view} />
             <Info title="Hold window" body={score?.hold_window} />
           </div>

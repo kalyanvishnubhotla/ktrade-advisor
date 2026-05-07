@@ -7,6 +7,7 @@ import yfinance as yf
 
 from .analysis import compute_indicators, score_ticker
 from .fibonacci import FibSetup, FibZone, calculate_fib_extensions, calculate_recent_fib_zones
+from .momentum import analyze_momentum
 from .pivots import Pivot, detect_multi_timeframe_pivots, nearest_support_resistance
 from .zones import SRZone, calculate_sr_zones, recommendation_zones
 
@@ -79,6 +80,21 @@ class TechnicalZoneAnalyzer:
             pivots = detect_multi_timeframe_pivots(history)
             if len(pivots) < 4:
                 raise ValueError("Not enough swing pivots for confluence zones")
+            momentum = analyze_momentum(history, pivots)
+            indicators.update(
+                {
+                    "rsi": momentum.get("rsi"),
+                    "rsi_interpretation": momentum.get("rsi_interpretation"),
+                    "macd": momentum.get("macd"),
+                    "macd_signal": momentum.get("macd_signal"),
+                    "macd_histogram": momentum.get("macd_histogram"),
+                    "macd_trend": momentum.get("macd_trend"),
+                    "momentum_score": momentum.get("score"),
+                    "momentum_label": momentum.get("label"),
+                    "momentum_summary": momentum.get("summary"),
+                    "momentum_divergence": ", ".join([f"{item.get('indicator')} {item.get('type')}" for item in momentum.get("divergences", [])]) or None,
+                }
+            )
             fib_setup, fib_zones = calculate_recent_fib_zones(pivots)
             sr_zones = calculate_sr_zones(pivots, fib_zones, indicators)
             if not sr_zones:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -70,9 +71,15 @@ def refresh_all() -> dict:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO indicators
-                    (ticker_id, as_of, price, ma20, ma50, ma200, rsi, macd, atr, volume_ratio, relative_strength,
+                    (ticker_id, as_of, price, ma20, ma50, ma200, bb_upper, bb_lower, bb_width_pct,
+                     rsi, rsi_interpretation, macd, macd_signal,
+                     macd_histogram, macd_trend, momentum_score, momentum_summary, momentum_divergence,
+                     adx, plus_di, minus_di, adx_interpretation, trend_direction, obv, obv_trend, volume_vs_20d,
+                     rising_volume_on_up_days, trend_alignment, trend_strength_score, trend_strength_label, trend_strength_summary,
+                     volume_confirmation, volume_confirmation_score, volume_confirmation_summary,
+                     atr, volume_ratio, relative_strength,
                      support, resistance, distance_to_support, distance_to_resistance, pattern_signal, earnings_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ticker["id"],
@@ -81,8 +88,34 @@ def refresh_all() -> dict:
                         ind.get("ma20"),
                         ind.get("ma50"),
                         ind.get("ma200"),
+                        ind.get("bb_upper"),
+                        ind.get("bb_lower"),
+                        ind.get("bb_width_pct"),
                         ind.get("rsi"),
+                        ind.get("rsi_interpretation"),
                         ind.get("macd"),
+                        ind.get("macd_signal"),
+                        ind.get("macd_histogram"),
+                        ind.get("macd_trend"),
+                        ind.get("momentum_score"),
+                        ind.get("momentum_summary"),
+                        ind.get("momentum_divergence"),
+                        ind.get("adx"),
+                        ind.get("plus_di"),
+                        ind.get("minus_di"),
+                        ind.get("adx_interpretation"),
+                        ind.get("trend_direction"),
+                        ind.get("obv"),
+                        ind.get("obv_trend"),
+                        ind.get("volume_vs_20d"),
+                        1 if ind.get("rising_volume_on_up_days") else 0,
+                        ind.get("trend_alignment"),
+                        ind.get("trend_strength_score"),
+                        ind.get("trend_strength_label"),
+                        ind.get("trend_strength_summary"),
+                        ind.get("volume_confirmation"),
+                        ind.get("volume_confirmation_score"),
+                        ind.get("volume_confirmation_summary"),
                         ind.get("atr"),
                         ind.get("volume_ratio"),
                         ind.get("relative_strength"),
@@ -100,9 +133,11 @@ def refresh_all() -> dict:
                     INSERT OR REPLACE INTO scores
                     (ticker_id, as_of, score, decision, confidence, risk, trend_label, momentum_label, volume_label,
                      news_label, summary, suggested_action, entry_range, invalidation_level, target1, target2,
-                     distance_to_buy_zone, buy_zone_confluence, buy_zone_explanation, target_zone_explanation,
-                     hold_window, why_rating, changes_view)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     distance_to_buy_zone, buy_zone_confluence, setup_factor_scores, setup_positive_factors,
+                     setup_concern_factors, decision_reasons, risk_reward_summary, improve_to_buy,
+                     buy_zone_explanation, target_zone_explanation,
+                     trend_strength_summary, momentum_summary, macd_trend, volume_confirmation_summary, hold_window, why_rating, changes_view)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ticker["id"],
@@ -123,8 +158,18 @@ def refresh_all() -> dict:
                         score["target2"],
                         score["distance_to_buy_zone"],
                         score["buy_zone_confluence"],
+                        json.dumps(score.get("setup_factor_scores") or []),
+                        json.dumps(score.get("setup_positive_factors") or []),
+                        json.dumps(score.get("setup_concern_factors") or []),
+                        json.dumps(score.get("decision_reasons") or []),
+                        score.get("risk_reward_summary"),
+                        score.get("improve_to_buy"),
                         score["buy_zone_explanation"],
                         score["target_zone_explanation"],
+                        score.get("trend_strength_summary"),
+                        score.get("momentum_summary"),
+                        score.get("macd_trend"),
+                        score.get("volume_confirmation_summary"),
                         score["hold_window"],
                         score["why_rating"],
                         score["changes_view"],

@@ -7,6 +7,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .confluence import build_confluence_checklist
+from .momentum import analyze_momentum
+from .trend_volume import analyze_trend_volume
+
 
 DISCLAIMER = "Decision support only. Not financial advice."
 
@@ -41,16 +45,14 @@ def compute_indicators(history: pd.DataFrame, spy_history: pd.DataFrame | None =
     ma20 = close.rolling(20).mean()
     ma50 = close.rolling(50).mean()
     ma200 = close.rolling(200).mean()
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    bb_width_pct = ((bb_upper - bb_lower) / bb_mid) * 100
 
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
+    momentum = analyze_momentum(df)
+    trend_volume = analyze_trend_volume(df)
 
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
@@ -87,8 +89,34 @@ def compute_indicators(history: pd.DataFrame, spy_history: pd.DataFrame | None =
         "ma20": clean_float(ma20.iloc[-1]),
         "ma50": clean_float(ma50.iloc[-1]),
         "ma200": clean_float(ma200.iloc[-1]),
-        "rsi": clean_float(rsi.iloc[-1]),
-        "macd": clean_float(macd.iloc[-1]),
+        "bb_upper": clean_float(bb_upper.iloc[-1]),
+        "bb_lower": clean_float(bb_lower.iloc[-1]),
+        "bb_width_pct": clean_float(bb_width_pct.iloc[-1]),
+        "rsi": clean_float(momentum.get("rsi")),
+        "rsi_interpretation": momentum.get("rsi_interpretation"),
+        "macd": clean_float(momentum.get("macd")),
+        "macd_signal": clean_float(momentum.get("macd_signal")),
+        "macd_histogram": clean_float(momentum.get("macd_histogram")),
+        "macd_trend": momentum.get("macd_trend"),
+        "momentum_score": momentum.get("score"),
+        "momentum_summary": momentum.get("summary"),
+        "momentum_divergence": ", ".join([f"{item.get('indicator')} {item.get('type')}" for item in momentum.get("divergences", [])]) or None,
+        "adx": clean_float(trend_volume.get("adx")),
+        "plus_di": clean_float(trend_volume.get("plus_di")),
+        "minus_di": clean_float(trend_volume.get("minus_di")),
+        "adx_interpretation": trend_volume.get("adx_interpretation"),
+        "trend_direction": trend_volume.get("trend_direction"),
+        "obv": clean_float(trend_volume.get("obv")),
+        "obv_trend": trend_volume.get("obv_trend"),
+        "volume_vs_20d": clean_float(trend_volume.get("volume_vs_20d")),
+        "rising_volume_on_up_days": trend_volume.get("rising_volume_on_up_days"),
+        "trend_alignment": trend_volume.get("trend_alignment"),
+        "trend_strength_score": trend_volume.get("trend_strength_score"),
+        "trend_strength_label": trend_volume.get("trend_strength_label"),
+        "trend_strength_summary": trend_volume.get("trend_strength_summary"),
+        "volume_confirmation": trend_volume.get("volume_confirmation"),
+        "volume_confirmation_score": trend_volume.get("volume_confirmation_score"),
+        "volume_confirmation_summary": trend_volume.get("volume_confirmation_summary"),
         "atr": clean_float(atr.iloc[-1]),
         "volume_ratio": clean_float(volume_ratio),
         "relative_strength": clean_float(relative_strength),
@@ -140,12 +168,65 @@ def plain_distance(value: float | None, near_word: str, far_word: str) -> str:
     return f"it is stretched from {far_word}"
 
 
+def build_decision_reasons(checklist: dict, trend_label: str, momentum_label: str, volume_label: str, risk: str) -> list[str]:
+    reasons = list(checklist.get("positive_factors") or [])
+    if len(reasons) < 3:
+        reasons.extend(
+            [
+                f"Trend reads {trend_label.lower()}",
+                f"Momentum reads {momentum_label.lower()}",
+                f"Volume reads {volume_label.lower()}",
+                f"Risk is {risk.lower()}",
+            ]
+        )
+    unique: list[str] = []
+    for reason in reasons:
+        if reason and reason not in unique:
+            unique.append(reason)
+    return unique[:3]
+
+
+def risk_reward_at_buy_area(entry_low: float, entry_high: float, invalidation: float, target1: float) -> str:
+    planned_entry = (entry_low + entry_high) / 2
+    downside = max(planned_entry - invalidation, 0.01)
+    upside = max(target1 - planned_entry, 0.01)
+    ratio = upside / downside
+    return (
+        f"If bought near the middle of the preferred area (${planned_entry:.2f}), "
+        f"the first review area offers about {ratio:.1f}:1 reward/risk "
+        f"(${upside:.2f} upside vs ${downside:.2f} risk)."
+    )
+
+
+def improve_to_buy_trigger(decision: str, entry_low: float, entry_high: float, rsi: float, volume_label: str, trend_label: str) -> str:
+    rsi_trigger = "RSI cools below 55" if rsi >= 55 else "RSI stays constructive"
+    volume_trigger = "volume stays supportive" if volume_label in ["Supportive", "Constructive", "Strong", "Good"] else "volume improves"
+    if decision == "Buy-worthy now":
+        return f"Already qualifies. Cleaner entry would be a pullback toward ${entry_low:.2f}-${entry_high:.2f} while {volume_trigger}."
+    if decision == "Wait for better price":
+        return f"Pullback into ${entry_low:.2f}-${entry_high:.2f}, {rsi_trigger}, and {volume_trigger}."
+    if decision == "Watch for breakout":
+        return f"A strong close above the review area with {volume_trigger}; or a pullback into ${entry_low:.2f}-${entry_high:.2f}."
+    if decision == "Avoid for now":
+        return f"Trend needs to repair first, then price should reclaim the preferred area with improving momentum."
+    if trend_label in ["Weak", "Mixed"]:
+        return f"Trend improves, price holds ${entry_low:.2f}-${entry_high:.2f}, and {volume_trigger}."
+    return f"Price gets closer to ${entry_low:.2f}-${entry_high:.2f}, {rsi_trigger}, and {volume_trigger}."
+
+
 def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3, zone_context: dict | None = None) -> dict:
     price = ind.get("price") or 0
     ma20 = ind.get("ma20")
     ma50 = ind.get("ma50")
     ma200 = ind.get("ma200")
     rsi = ind.get("rsi") or 50
+    momentum_quality = ind.get("momentum_score")
+    momentum_summary = ind.get("momentum_summary")
+    macd_trend = ind.get("macd_trend")
+    trend_quality = ind.get("trend_strength_score")
+    volume_quality = ind.get("volume_confirmation_score")
+    trend_summary = ind.get("trend_strength_summary")
+    volume_summary = ind.get("volume_confirmation_summary")
     volume_ratio = ind.get("volume_ratio") or 1
     rs = ind.get("relative_strength") or 0
     support = ind.get("support")
@@ -157,27 +238,36 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     fib_extensions = zone_context.get("fib_extensions") or {}
 
     trend = 0
-    if ma20 and price > ma20:
-        trend += 6
-    if ma50 and price > ma50:
-        trend += 6
-    if ma200 and price > ma200:
-        trend += 5
-    if ma20 and ma50 and ma20 > ma50:
-        trend += 3
+    if trend_quality is not None:
+        trend = max(0, min(20, (float(trend_quality) / 100) * 20))
+    else:
+        if ma20 and price > ma20:
+            trend += 6
+        if ma50 and price > ma50:
+            trend += 6
+        if ma200 and price > ma200:
+            trend += 5
+        if ma20 and ma50 and ma20 > ma50:
+            trend += 3
 
-    momentum = 7
-    if 45 <= rsi <= 68:
-        momentum += 5
-    elif 68 < rsi <= 75:
-        momentum += 2
-    elif rsi < 38 or rsi > 78:
-        momentum -= 4
-    if rs > 0:
-        momentum += 3
-    momentum = max(0, min(15, momentum))
+    if momentum_quality is not None:
+        momentum = max(0, min(15, (float(momentum_quality) / 100) * 15))
+    else:
+        momentum = 7
+        if 45 <= rsi <= 68:
+            momentum += 5
+        elif 68 < rsi <= 75:
+            momentum += 2
+        elif rsi < 38 or rsi > 78:
+            momentum -= 4
+        if rs > 0:
+            momentum += 3
+        momentum = max(0, min(15, momentum))
 
-    volume = max(0, min(10, 5 + (volume_ratio - 1) * 5))
+    if volume_quality is not None:
+        volume = max(0, min(10, (float(volume_quality) / 100) * 10))
+    else:
+        volume = max(0, min(10, 5 + (volume_ratio - 1) * 5))
 
     sr = 7
     if support and price:
@@ -222,6 +312,8 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     distance_to_buy_zone = None
     if demand_zone and price:
         distance_to_buy_zone = max(0, (price / demand_zone["price_high"] - 1) * 100)
+    checklist = build_confluence_checklist(ind, demand_zone, distance_to_buy_zone)
+    setup_quality = checklist["total"]
 
     if score >= 78 and risk != "High" and (distance_to_buy_zone is None or distance_to_buy_zone <= 3):
         decision = "Buy-worthy now"
@@ -238,12 +330,12 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
 
     distance_support = ind.get("distance_to_support")
     distance_resistance = ind.get("distance_to_resistance")
-    trend_label = label(trend, 16, 11, 6)
-    momentum_label = label(momentum, 12, 9, 5)
-    volume_label = label(volume, 8, 6, 4)
+    trend_label = ind.get("trend_strength_label") or label(trend, 16, 11, 6)
+    momentum_label = ind.get("momentum_label") or label(momentum, 12, 9, 5)
+    volume_label = ind.get("volume_confirmation") or label(volume, 8, 6, 4)
     support_phrase = plain_distance(distance_support, "its support area", "a safer buy area")
     target_phrase = plain_distance(distance_resistance, "a review target", "the next review target")
-    volume_phrase = "buyers are showing better activity" if volume_label in ["Strong", "Good"] else "volume is not adding much confirmation"
+    volume_phrase = "buyers are showing better activity" if volume_label in ["Strong", "Good", "Supportive", "Constructive"] else "volume is not adding much confirmation"
     trend_phrase = {
         "Strong": "the trend is in good shape",
         "Good": "the trend is constructive",
@@ -253,7 +345,7 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
 
     if decision == "Buy-worthy now":
         zone_text = f"near a {demand_zone['confluence_score']:.0f}/100 demand zone" if demand_zone else support_phrase
-        summary = f"The setup qualifies because {trend_phrase}, price is {zone_text}, and {volume_phrase}. Keep position size modest if risk is {risk.lower()}."
+        summary = f"The setup qualifies because {trend_phrase}, price is {zone_text}, and momentum is {momentum_label.lower()}. Keep position size modest if risk is {risk.lower()}."
         action = "Consider a small starter buy only if it fits your portfolio and risk limit."
     elif decision == "Wait for better price":
         if demand_zone and distance_to_buy_zone is not None:
@@ -294,6 +386,10 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     if target2 <= target1 and fib_extensions.get("1.618"):
         target2 = fib_extensions["1.618"]
 
+    decision_reasons = build_decision_reasons(checklist, trend_label, momentum_label, volume_label, risk)
+    risk_reward_summary = risk_reward_at_buy_area(entry_low, entry_high, invalidation, target1)
+    improve_trigger = improve_to_buy_trigger(decision, entry_low, entry_high, rsi, volume_label, trend_label)
+
     return {
         "score": score,
         "band": band,
@@ -301,8 +397,12 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         "confidence": "High" if score >= 80 or score < 40 else "Medium" if score >= 55 else "Low",
         "risk": risk,
         "trend_label": trend_label,
+        "trend_strength_summary": trend_summary,
         "momentum_label": momentum_label,
+        "momentum_summary": momentum_summary,
+        "macd_trend": macd_trend,
         "volume_label": volume_label,
+        "volume_confirmation_summary": volume_summary,
         "news_label": news_label,
         "summary": summary,
         "suggested_action": action,
@@ -311,11 +411,17 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         "target1": f"${target1:.2f}",
         "target2": f"${target2:.2f}",
         "distance_to_buy_zone": round(distance_to_buy_zone, 1) if distance_to_buy_zone is not None else None,
-        "buy_zone_confluence": round(demand_zone["confluence_score"], 0) if demand_zone else None,
+        "buy_zone_confluence": setup_quality,
+        "setup_factor_scores": checklist["factors"],
+        "setup_positive_factors": checklist["positive_factors"],
+        "setup_concern_factors": checklist["concern_factors"],
+        "decision_reasons": decision_reasons,
+        "risk_reward_summary": risk_reward_summary,
+        "improve_to_buy": improve_trigger,
         "buy_zone_explanation": demand_zone.get("plain_english") if demand_zone else None,
         "target_zone_explanation": supply_zones[0].get("plain_english") if supply_zones else None,
         "hold_window": "4-8 weeks for a swing setup; longer only if fundamentals still fit.",
-        "why_rating": f"Trend is {label(trend, 16, 11, 6).lower()}, momentum is {label(momentum, 12, 9, 5).lower()}, research is {news_label.lower()}, and risk is {risk.lower()}.",
+        "why_rating": f"Trend is {trend_label.lower()}, momentum is {momentum_label.lower()}, volume is {volume_label.lower()}, research is {news_label.lower()}, and risk is {risk.lower()}.",
         "changes_view": "A break below the risk level, weakening market, negative research, or heavy selling would lower the rating.",
     }
 

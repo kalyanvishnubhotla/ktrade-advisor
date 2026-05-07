@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import threading
 import time
 import webbrowser
@@ -104,9 +105,17 @@ def dashboard() -> dict:
                 """
                 SELECT t.id AS ticker_id, t.symbol, t.company, t.theme, t.asset_type,
                        i.price, i.as_of, i.support, i.resistance, i.distance_to_support, i.distance_to_resistance,
-                       i.pattern_signal, s.score, s.decision, s.confidence, s.risk, s.trend_label, s.momentum_label,
-                       s.volume_label, s.news_label, s.summary, s.suggested_action, s.entry_range,
+                       i.pattern_signal, i.rsi, i.rsi_interpretation, i.macd, i.macd_signal, i.macd_histogram,
+                       i.macd_trend AS indicator_macd_trend, i.momentum_score, i.momentum_divergence,
+                       i.adx, i.adx_interpretation, i.trend_alignment, i.trend_strength_score, i.trend_strength_summary,
+                       i.obv_trend, i.volume_vs_20d, i.rising_volume_on_up_days, i.volume_confirmation, i.volume_confirmation_summary,
+                       s.score, s.decision, s.confidence, s.risk, s.trend_label, s.momentum_label,
+                       s.trend_strength_summary AS score_trend_strength_summary, s.momentum_summary, s.macd_trend, s.volume_label,
+                       s.volume_confirmation_summary AS score_volume_confirmation_summary,
+                       s.news_label, s.summary, s.suggested_action, s.entry_range,
                        s.invalidation_level, s.target1, s.target2, s.distance_to_buy_zone, s.buy_zone_confluence,
+                       s.setup_factor_scores, s.setup_positive_factors, s.setup_concern_factors,
+                       s.decision_reasons, s.risk_reward_summary, s.improve_to_buy,
                        s.buy_zone_explanation, s.target_zone_explanation, s.hold_window, s.why_rating, s.changes_view,
                        (SELECT COUNT(*) FROM news_ticker_matches WHERE ticker_id = t.id) AS news_count,
                        (SELECT COUNT(*) FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id AND ni.sentiment = 'Positive') AS positive_news_count,
@@ -122,6 +131,7 @@ def dashboard() -> dict:
             ).fetchall()
         )
         for card in cards:
+            hydrate_setup_checklist(card)
             if card.get("price"):
                 support_zone, resistance_zone = nearest_zones(card["ticker_id"], card["price"])
                 card["nearest_support_zone"] = support_zone
@@ -149,6 +159,23 @@ def dashboard() -> dict:
         "watchlists": watchlists,
         "disclaimer": DISCLAIMER,
     }
+
+
+def parse_json_list(value: str | None) -> list:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def hydrate_setup_checklist(item: dict) -> None:
+    item["setup_factor_scores"] = parse_json_list(item.get("setup_factor_scores"))
+    item["setup_positive_factors"] = parse_json_list(item.get("setup_positive_factors"))
+    item["setup_concern_factors"] = parse_json_list(item.get("setup_concern_factors"))
+    item["decision_reasons"] = parse_json_list(item.get("decision_reasons"))
 
 
 def watchlist_summary(conn) -> list[dict]:
@@ -312,6 +339,8 @@ def ticker_detail(symbol: str) -> dict:
         )
         indicators = conn.execute("SELECT * FROM indicators WHERE ticker_id = ?", (ticker_id,)).fetchone()
         scores = rows_to_dicts(conn.execute("SELECT * FROM scores WHERE ticker_id = ? ORDER BY as_of DESC LIMIT 20", (ticker_id,)).fetchall())
+        for score in scores:
+            hydrate_setup_checklist(score)
         research = rows_to_dicts(conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at DESC", (ticker_id,)).fetchall())
         recommendations = rows_to_dicts(conn.execute("SELECT * FROM recommendations WHERE ticker_id = ? ORDER BY created_at DESC LIMIT 20", (ticker_id,)).fetchall())
         pivots = cached_pivots(ticker_id)
