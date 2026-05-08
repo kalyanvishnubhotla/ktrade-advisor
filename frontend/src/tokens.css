@@ -1,0 +1,146 @@
+/* ============================================================
+   KTrade Advisor — Design Token System
+   Dark professional theme inspired by Robinhood/Bloomberg
+   ============================================================ */
+
+:root {
+  /* ── Backgrounds ─────────────────────────────────────────── */
+  --bg-base:        #000000;   /* App root */
+  --bg-surface-1:   #0d0d0d;   /* Main content area */
+  --bg-surface-2:   #111111;   /* Cards, panels */
+  --bg-surface-3:   #181818;   /* Nested panels, sub-cards */
+  --bg-surface-4:   #1e1e1e;   /* Inputs, hover states */
+  --bg-sidebar:     #0a0a0a;   /* Left nav */
+  --bg-topbar:      #0d0d0d;   /* Top bar */
+  --bg-modal:       #141414;   /* Modal backdrop content */
+  --bg-overlay:     rgba(0, 0, 0, 0.75); /* Backdrop overlay */
+
+  /* ── Borders ─────────────────────────────────────────────── */
+  --border-subtle:  #1e1e1e;   /* Between surface layers */
+  --border-default: #2a2a2a;   /* Card, panel borders */
+  --border-strong:  #3a3a3a;   /* Input borders, dividers */
+  --border-focus:   #00C805;   /* Focused input ring */
+
+  /* ── Text ────────────────────────────────────────────────── */
+  --text-primary:   #ffffff;
+  --text-secondary: #a0a0a0;
+  --text-tertiary:  #666666;
+  --text-disabled:  #444444;
+  --text-inverse:   #000000;
+
+  /* ── Brand / Semantic Colors ─────────────────────────────── */
+  --green:          #00C805;   /* Buy-worthy, strong, up */
+  --green-dim:      #004d02;   /* Green background tint */
+  --green-muted:    #00C80520; /* Very subtle green bg */
+  --green-text:     #00e606;   /* Lighter green on dark */
+
+  --red:            #FF5000;   /* Avoid, weak, down */
+  --red-dim:        #5a1a00;   /* Red background tint */
+  --red-muted:      #FF500020; /* Very subtle red bg */
+  --red-text:       #ff6a2a;   /* Lighter red on dark */
+
+  --gold:           #F5A623;   /* Wait, watch */
+  --gold-dim:       #5a3a00;   /* Gold background tint */
+  --gold-muted:     #F5A62320; /* Very subtle gold bg */
+  --gold-text:      #ffbe5c;   /* Lighter gold on dark */
+
+  --blue:           #3B82F6;   /* Neutral info, hold */
+  --blue-dim:       #1e3a6e;   /* Blue background tint */
+  --blue-muted:     #3B82F620; /* Very subtle blue bg */
+  --blue-text:      #60a5fa;   /* Lighter blue on dark */
+
+  --purple:         #8B5CF6;   /* Research, AI signals */
+  --purple-muted:   #8B5CF620;
+
+  /* ── Score Band Colors ───────────────────────────────────── */
+  --score-strong:   var(--green);      /* 78–100 */
+  --score-good:     #7BC47F;           /* 64–77 */
+  --score-mixed:    var(--gold);       /* 50–63 */
+  --score-weak:     var(--red-text);   /* < 50 */
+
+  /* ── Decision Colors (pill backgrounds) ─────────────────── */
+  --decision-buy-bg:    var(--green-muted);
+  --decision-buy-text:  var(--green-text);
+  --decision-buy-border: var(--green-dim);
+
+  --decision-wait-bg:    var(--gold-muted);
+  --decision-wait-text:  var(--gold-text);
+  --decision-wait-border: var(--gold-dim);
+
+  --decision-watch-bg:   var(--blue-muted);
+  --decision-watch-text: var(--blue-text);
+  --decision-watch-border: var(--blue-dim);
+
+  --decision-hold-bg:    rgba(100,100,100,0.12);
+  --decision-hold-text:  #a0a0a0;
+  --decision-hold-border: #333333;
+
+  --decision-avoid-bg:   var(--red-muted);
+  --decision-avoid-text: var(--red-text);
+  --decision-avoid-border: var(--red-dim);
+
+  /* ── Typography ──────────────────────────────────────────── */
+  --font-family:    -apple-system, BlinkMacSystemFont, 'SF Pro Display',
+                    'Segoe UI', 'Inter', sans-serif;
+  --font-mono:      'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+
+  --text-xs:    11px;
+  --text-sm:    12px;
+  --text-base:  14px;
+  --text-md:    15px;
+  --text-lg:    16px;
+  --text-xl:    18px;
+  --text-2xl:   22px;
+  --text-3xl:   28px;
+  --text-4xl:   36px;
+
+  --weight-regular:  400;
+  --weight-medium:   500;
+  --weight-semibold: 600;
+  --weight-bold:     700;
+
+  --leading-tight:   1.2;
+  --leading-normal:  1.5;
+  --leading-loose:   1.8;
+
+  /* ── Spacing ─────────────────────────────────────────────── */
+  --space-1:   4px;
+  --space-2:   8px;
+  --space-3:   12px;
+  --space-4:   16px;
+  --space-5:   20px;
+  --space-6:   24px;
+  --space-8:   32px;
+  --space-10:  40px;
+  --space-12:  48px;
+  --space-16:  64px;
+
+  /* ── Border Radius ───────────────────────────────────────── */
+  --radius-sm:   4px;
+  --radius-md:   8px;
+  --radius-lg:   12px;
+  --radius-xl:   16px;
+  --radius-full: 9999px;
+
+  /* ── Shadows / Elevation ─────────────────────────────────── */
+  --shadow-sm:   0 1px 3px rgba(0,0,0,0.5);
+  --shadow-md:   0 4px 12px rgba(0,0,0,0.6);
+  --shadow-lg:   0 8px 32px rgba(0,0,0,0.7);
+  --shadow-glow-green: 0 0 16px rgba(0,200,5,0.15);
+  --shadow-glow-red:   0 0 16px rgba(255,80,0,0.15);
+
+  /* ── Layout Dimensions ───────────────────────────────────── */
+  --sidebar-width:  220px;
+  --topbar-height:  56px;
+
+  /* ── Transitions ─────────────────────────────────────────── */
+  --transition-fast:   120ms ease;
+  --transition-base:   200ms ease;
+  --transition-slow:   320ms ease;
+
+  /* ── Z-Index Stack ───────────────────────────────────────── */
+  --z-base:    1;
+  --z-sticky:  100;
+  --z-modal:   400;
+  --z-toast:   600;
+}
