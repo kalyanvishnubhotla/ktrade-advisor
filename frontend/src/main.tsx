@@ -230,6 +230,7 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
+  const [showGuide, setShowGuide] = useState(false);
 
   const load = async () => {
     setError('');
@@ -245,6 +246,9 @@ function App() {
 
   useEffect(() => {
     load();
+    if (window.localStorage.getItem('ktrade_onboarding_seen') !== 'true') {
+      setShowGuide(true);
+    }
   }, []);
 
   const refresh = async () => {
@@ -295,10 +299,13 @@ function App() {
             <h2>{dashboard?.market.label ?? 'Loading...'}</h2>
             <p>{dashboard?.market.explanation ?? 'Checking local data.'}</p>
           </div>
-          <button className="primary" onClick={refresh} disabled={refreshing}>
-            <RefreshCw size={18} className={refreshing ? 'spin' : ''} />
-            {refreshing ? 'Refreshing' : 'Refresh'}
-          </button>
+          <div className="topbar-actions">
+            <button onClick={() => setShowGuide(true)}><InfoIcon size={18} />Guide</button>
+            <button className="primary" onClick={refresh} disabled={refreshing}>
+              <RefreshCw size={18} className={refreshing ? 'spin' : ''} />
+              {refreshing ? 'Refreshing' : 'Refresh'}
+            </button>
+          </div>
         </header>
 
         {error && <div className="alert"><ShieldAlert size={18} /> {error}</div>}
@@ -337,6 +344,10 @@ function App() {
         {!loading && page === 'history' && <HistoryView />}
         {!loading && page === 'learningInsights' && <LearningInsightsView />}
         {!loading && page === 'settings' && <SettingsView />}
+        {showGuide && <FirstRunGuide onClose={() => {
+          window.localStorage.setItem('ktrade_onboarding_seen', 'true');
+          setShowGuide(false);
+        }} />}
       </main>
     </div>
   );
@@ -347,6 +358,61 @@ function NavButton({ page, current, setPage, icon, label }: { page: Page; curren
     window.history.pushState({}, '', page === 'learningInsights' ? '/learning-insights' : '/');
     setPage(page);
   }}>{icon}{label}</button>;
+}
+
+function FirstRunGuide({ onClose }: { onClose: () => void }) {
+  const steps = [
+    {
+      title: 'Start With The Dashboard',
+      body: 'Each card gives a plain-English decision: buy-worthy, wait, watch, hold, or avoid. Treat it as a decision aid, not a command.',
+    },
+    {
+      title: 'Refresh Pulls Local Data',
+      body: 'Refresh updates prices, indicators, news matches, and recommendation snapshots. Everything is stored on this Mac in a local SQLite file.',
+    },
+    {
+      title: 'Use The Price Areas Calmly',
+      body: 'Preferred buy area is where a new buy may be calmer. Review area is where you reassess. Risk line is where the setup may be weakening.',
+    },
+    {
+      title: 'Track Decisions',
+      body: 'Click Track this decision when a recommendation matters. Later, mark what you did and the outcome so the app can learn which setups work for you.',
+    },
+    {
+      title: 'Paste Research Signals',
+      body: 'Use ChatGPT or Perplexity to summarize an article, video, or earnings note, then paste the structured signal into Research Signal. You approve before it affects scores.',
+    },
+  ];
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal guide-modal">
+        <div className="row">
+          <div>
+            <p className="eyebrow">First-Time Guide</p>
+            <h3>Welcome to Ktrade Advisor</h3>
+          </div>
+          <button onClick={onClose}>Close</button>
+        </div>
+        <p className="summary">This app is for calm, beginner-friendly stock and ETF decision support. Decision support only. Not financial advice.</p>
+        <div className="guide-steps">
+          {steps.map((step, index) => (
+            <div className="guide-step" key={step.title}>
+              <span>{index + 1}</span>
+              <div>
+                <b>{step.title}</b>
+                <p>{step.body}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="help-strip">
+          <span><b>Normal use:</b> open app, refresh, scan cards, click a ticker for detail.</span>
+          <span><b>Learning use:</b> track decisions, then record outcomes later.</span>
+        </div>
+        <button className="primary" onClick={onClose}>Start using the app</button>
+      </div>
+    </div>
+  );
 }
 
 function DashboardView({ cards, watchlists, news, showHelp, onSelect, onTrack }: { cards: Card[]; watchlists: Watchlist[]; news: NewsItem[]; showHelp: boolean; onSelect: (symbol: string) => void; onTrack: (symbol: string) => Promise<void> }) {

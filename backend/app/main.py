@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import threading
 import time
 import webbrowser
@@ -669,9 +670,11 @@ if frontend_dist.exists():
 
 def open_browser() -> None:
     time.sleep(1.2)
-    webbrowser.open("http://127.0.0.1:8000")
+    port = int(os.environ.get("KTRADE_PORT", "8000"))
+    webbrowser.open(f"http://127.0.0.1:{port}")
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("KTRADE_PORT", "8000"))
     threading.Thread(target=open_browser, daemon=True).start()
-    uvicorn.run("backend.app.main:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("backend.app.main:app", host="127.0.0.1", port=port, reload=False)
