@@ -10,6 +10,7 @@ from .database import db, rows_to_dicts, upsert_ticker
 from .fibonacci import cache_fib_zones
 from .news import refresh_news
 from .pivots import cache_pivots
+from .recommendation_snapshots import save_snapshot
 from .technical_zone_analyzer import TechnicalZoneAnalyzer
 from .zones import cache_sr_zones
 
@@ -21,6 +22,7 @@ def fetch_history(symbol: str, period: str = "2y") -> tuple[pd.DataFrame, dict]:
 def refresh_all() -> dict:
     refreshed: list[str] = []
     failed: list[dict] = []
+    snapshots_saved = 0
     with db() as conn:
         tickers = rows_to_dicts(conn.execute("SELECT * FROM tickers ORDER BY symbol").fetchall())
 
@@ -39,6 +41,11 @@ def refresh_all() -> dict:
                     conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at", (ticker["id"],)).fetchall()
                 )
             analysis = analyzer.analyze(symbol, spy_history=spy_history, research_signals=signals)
+            try:
+                save_snapshot(symbol, analysis)
+                snapshots_saved += 1
+            except Exception as exc:
+                failed.append({"symbol": symbol, "reason": f"Snapshot save failed: {exc}"})
             history = analysis.history
             info = analysis.info
             ind = analysis.indicators
@@ -124,7 +131,7 @@ def refresh_all() -> dict:
                         ind.get("distance_to_support"),
                         ind.get("distance_to_resistance"),
                         ind.get("pattern_signal"),
-                        None,
+                        ind.get("earnings_date"),
                     ),
                 )
                 as_of = datetime.now(timezone.utc).isoformat()
@@ -136,8 +143,9 @@ def refresh_all() -> dict:
                      distance_to_buy_zone, buy_zone_confluence, setup_factor_scores, setup_positive_factors,
                      setup_concern_factors, decision_reasons, risk_reward_summary, improve_to_buy,
                      buy_zone_explanation, target_zone_explanation,
+                     fresh_high_targets, fresh_high_target_note,
                      trend_strength_summary, momentum_summary, macd_trend, volume_confirmation_summary, hold_window, why_rating, changes_view)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ticker["id"],
@@ -166,6 +174,8 @@ def refresh_all() -> dict:
                         score.get("improve_to_buy"),
                         score["buy_zone_explanation"],
                         score["target_zone_explanation"],
+                        1 if score.get("fresh_high_targets") else 0,
+                        score.get("fresh_high_target_note"),
                         score.get("trend_strength_summary"),
                         score.get("momentum_summary"),
                         score.get("macd_trend"),
@@ -208,7 +218,7 @@ def refresh_all() -> dict:
             ("; ".join(f"{item['symbol']}: {item['reason']}" for item in failed[:6]),),
         )
     news = refresh_news()
-    return {"refreshed": refreshed, "failed": failed, "market": market.__dict__, "news": news}
+    return {"refreshed": refreshed, "failed": failed, "snapshots_saved": snapshots_saved, "market": market.__dict__, "news": news}
 
 
 def refresh_if_empty() -> None:

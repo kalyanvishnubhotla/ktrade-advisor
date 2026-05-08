@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import pandas as pd
 import yfinance as yf
@@ -8,7 +9,7 @@ import yfinance as yf
 from .analysis import compute_indicators, score_ticker
 from .fibonacci import FibSetup, FibZone, calculate_fib_extensions, calculate_recent_fib_zones
 from .momentum import analyze_momentum
-from .pivots import Pivot, detect_multi_timeframe_pivots, nearest_support_resistance
+from .pivots import Pivot, detect_multi_timeframe_pivots, major_swings, nearest_support_resistance
 from .zones import SRZone, calculate_sr_zones, recommendation_zones
 
 
@@ -44,9 +45,44 @@ class TechnicalZoneAnalyzer:
                 "company": raw_info.get("shortName") or raw_info.get("longName"),
                 "asset_type": "etf" if raw_info.get("quoteType") == "ETF" else "stock",
             }
+            earnings_date = self.next_earnings_date(ticker)
+            if earnings_date:
+                info["earnings_date"] = earnings_date
         except Exception:
             info = {}
         return history, info
+
+    def next_earnings_date(self, ticker: yf.Ticker) -> str | None:
+        candidates: list[pd.Timestamp] = []
+        try:
+            dates = ticker.get_earnings_dates(limit=4)
+            if dates is not None and not dates.empty:
+                candidates.extend(pd.Timestamp(index_value) for index_value in dates.index)
+        except Exception:
+            pass
+        try:
+            calendar = ticker.calendar
+            if isinstance(calendar, dict):
+                for value in calendar.values():
+                    if isinstance(value, (list, tuple)):
+                        candidates.extend(pd.Timestamp(item) for item in value if item is not None)
+                    elif value is not None:
+                        candidates.append(pd.Timestamp(value))
+        except Exception:
+            pass
+        if not candidates:
+            return None
+        now = pd.Timestamp(datetime.now(timezone.utc))
+        normalized = []
+        for candidate in candidates:
+            if candidate.tzinfo is None:
+                candidate = candidate.tz_localize("UTC")
+            else:
+                candidate = candidate.tz_convert("UTC")
+            normalized.append(candidate)
+        future = sorted([candidate for candidate in normalized if candidate >= now])
+        chosen = future[0] if future else max(normalized)
+        return chosen.date().isoformat()
 
     def analyze(
         self,
@@ -64,6 +100,8 @@ class TechnicalZoneAnalyzer:
 
         signals = research_signals or []
         indicators = compute_indicators(history, spy_history)
+        if info.get("earnings_date"):
+            indicators["earnings_date"] = info["earnings_date"]
         pivots: list[Pivot] = []
         fib_setup: FibSetup | None = None
         fib_zones: list[FibZone] = []
@@ -93,6 +131,7 @@ class TechnicalZoneAnalyzer:
                     "momentum_label": momentum.get("label"),
                     "momentum_summary": momentum.get("summary"),
                     "momentum_divergence": ", ".join([f"{item.get('indicator')} {item.get('type')}" for item in momentum.get("divergences", [])]) or None,
+                    "momentum_warnings": momentum.get("warnings") or [],
                 }
             )
             fib_setup, fib_zones = calculate_recent_fib_zones(pivots)
@@ -103,6 +142,9 @@ class TechnicalZoneAnalyzer:
             if fib_setup:
                 raw_extensions = calculate_fib_extensions(fib_setup.start_price, fib_setup.end_price)
                 fib_extensions = {"1.272": raw_extensions.get(1.272), "1.618": raw_extensions.get(1.618)}
+            fresh_high_extensions = self.fresh_high_extensions(history, pivots, indicators.get("price") or 0)
+            if fresh_high_extensions:
+                fib_extensions = fresh_high_extensions
 
             support, resistance = nearest_support_resistance(pivots, indicators.get("price") or 0)
             if support:
@@ -157,3 +199,54 @@ class TechnicalZoneAnalyzer:
                 "fib_extensions": fib_extensions,
             },
         )
+
+    def fresh_high_extensions(self, history: pd.DataFrame, pivots: list[Pivot], price: float) -> dict[str, float | None]:
+        if price <= 0 or history.empty:
+            return {"1.272": None, "1.618": None}
+        df = history.copy()
+        df.columns = [str(column).lower() for column in df.columns]
+        if "high" not in df.columns or "low" not in df.columns:
+            return {"1.272": None, "1.618": None}
+
+        recent = df.tail(252)
+        high_52_week = float(recent["high"].max())
+        available_high = float(df["high"].max())
+        near_52_week_high = price >= high_52_week * 0.98
+        near_available_high = price >= available_high * 0.98
+        if not (near_52_week_high or near_available_high):
+            return {"1.272": None, "1.618": None}
+
+        rows = major_swings(pivots, min_rank=14, limit=120)
+        highs = [row for row in rows if row["type"] == "high"]
+        high_pivot = max(highs, key=lambda row: float(row["price"]), default=None)
+        high_price = max(available_high, float(high_pivot["price"]) if high_pivot else available_high)
+        high_date = high_pivot["date"] if high_pivot else str(df["high"].idxmax().date())
+        lows_before_high = [
+            row for row in rows
+            if row["type"] == "low" and row["date"] < high_date and float(row["price"]) < high_price
+        ]
+        low_pivot = max(lows_before_high, key=lambda row: (row.get("strength", 0), row["date"]), default=None)
+        if low_pivot:
+            low_price = float(low_pivot["price"])
+            low_date = low_pivot["date"]
+        else:
+            before_high = df.loc[df.index <= pd.Timestamp(high_date)]
+            if before_high.empty:
+                before_high = df
+            low_price = float(before_high.tail(252)["low"].min())
+            low_date = str(before_high.tail(252)["low"].idxmin().date())
+        if low_price <= 0 or high_price <= low_price:
+            return {"1.272": None, "1.618": None}
+
+        raw_extensions = calculate_fib_extensions(low_price, high_price)
+        return {
+            "1.272": raw_extensions.get(1.272),
+            "1.618": raw_extensions.get(1.618),
+            "fresh_high": True,
+            "near_52_week_high": near_52_week_high,
+            "near_available_high": near_available_high,
+            "swing_low": low_price,
+            "swing_high": high_price,
+            "swing_low_date": low_date,
+            "swing_high_date": high_date,
+        }

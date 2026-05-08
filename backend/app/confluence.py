@@ -78,16 +78,27 @@ def score_momentum(ind: dict) -> FactorResult:
     rsi = ind.get("rsi")
     macd_trend = ind.get("macd_trend") or "MACD unclear"
     divergence = ind.get("momentum_divergence")
+    warnings = ind.get("momentum_warnings") or []
     if rsi is not None and rsi > 70:
-        concern = f"RSI {rsi:.1f} is overbought"
+        warnings = [
+            {
+                "message": "Price has climbed quickly — it may pause or pull back a bit to rest.",
+            }
+        ] + warnings
+    if warnings:
+        score = clamp(score - min(14, 7 * len(warnings)))
+    if rsi is not None and rsi > 70:
+        concern = "The recent climb may be getting stretched"
+    elif warnings:
+        concern = warnings[0].get("message") or "Momentum is slowing, so price may pause"
     elif divergence and "Bearish" in divergence:
-        concern = f"{divergence} may slow upside"
+        concern = "Momentum is slowing down even though price is still rising"
     elif score < 45:
         concern = "Momentum is not yet supportive"
     else:
         concern = None
     if score >= 65:
-        positive = f"Momentum is supportive: RSI {rsi:.1f}, {macd_trend}" if rsi is not None else f"Momentum is supportive: {macd_trend}"
+        positive = "Momentum is supportive"
     else:
         positive = None
     return FactorResult("momentum", "Momentum", score, positive, concern)

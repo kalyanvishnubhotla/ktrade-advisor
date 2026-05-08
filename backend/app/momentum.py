@@ -5,6 +5,7 @@ from dataclasses import asdict
 import pandas as pd
 
 from .pivots import Pivot, normalize_ohlc
+from .plain_english import warning
 
 
 def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
@@ -113,7 +114,105 @@ def detect_divergence(price_pivots: list[dict], oscillator: pd.Series, direction
     return None
 
 
-def momentum_score(rsi_value: float | None, macd_line: float | None, signal_line: float | None, histogram: float | None, divergences: list[dict]) -> int:
+def detect_rsi_bearish_divergence(highs: list[dict], rsi_series: pd.Series) -> dict | None:
+    recent = highs[-3:]
+    if len(recent) < 2:
+        return None
+    pairs = []
+    for pivot in recent:
+        value = indicator_at(rsi_series, pivot["date"])
+        if value is not None:
+            pairs.append((pivot, value))
+    if len(pairs) < 2:
+        return None
+    previous, current = pairs[-2], pairs[-1]
+    if current[0]["price"] > previous[0]["price"] and current[1] < previous[1]:
+        return {
+            "type": "RSI Bearish Divergence",
+            "date": current[0]["date"],
+            "price_from": previous[0]["price"],
+            "price_to": current[0]["price"],
+            "indicator_from": previous[1],
+            "indicator_to": current[1],
+            "plain": "The price is still going up, but the strength behind it is getting weaker.",
+            "means": "This often happens before a stock takes a short rest or pulls back.",
+            "action": "Consider waiting for a better entry. It can still be okay to hold if you have a long-term view.",
+        }
+    if len(pairs) == 3:
+        first, middle, latest = pairs
+        price_rising = first[0]["price"] < middle[0]["price"] < latest[0]["price"]
+        rsi_falling = first[1] > middle[1] > latest[1]
+        if price_rising and rsi_falling:
+            return {
+                "type": "RSI Bearish Divergence",
+                "date": latest[0]["date"],
+                "price_from": first[0]["price"],
+                "price_to": latest[0]["price"],
+                "indicator_from": first[1],
+                "indicator_to": latest[1],
+                "plain": "The speed of the climb is getting weaker.",
+                "means": "This often happens before a stock pauses or pulls back.",
+                "action": "Consider waiting for a better entry. It can still be okay to hold if you have a long-term view.",
+            }
+    return None
+
+
+def candle_parts(row: pd.Series) -> tuple[float, float, float, float, float, float]:
+    open_price = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
+    body = abs(close - open_price)
+    full_range = max(high - low, 0.01)
+    return open_price, high, low, close, body, full_range
+
+
+def detect_bearish_reversal_candle(df: pd.DataFrame) -> dict | None:
+    if len(df) < 60:
+        return None
+    recent_high = float(df["high"].tail(60).max())
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    third = df.iloc[-3]
+    near_high = float(last["high"]) >= recent_high * 0.96 or float(prev["high"]) >= recent_high * 0.96
+    if not near_high:
+        return None
+
+    open_price, high, low, close, body, full_range = candle_parts(last)
+    prev_open, prev_high, prev_low, prev_close, prev_body, prev_range = candle_parts(prev)
+    third_open, _, _, third_close, third_body, _ = candle_parts(third)
+    upper_shadow = high - max(open_price, close)
+    lower_shadow = min(open_price, close) - low
+
+    warning = None
+    if upper_shadow >= body * 2 and upper_shadow >= full_range * 0.45 and lower_shadow <= full_range * 0.25 and close < open_price:
+        warning = "Shooting Star"
+    elif prev_close > prev_open and close < open_price and open_price >= prev_close and close <= prev_open:
+        warning = "Bearish Engulfing"
+    elif prev_close > prev_open and open_price > prev_close and close < (prev_open + prev_close) / 2 and close > prev_open:
+        warning = "Dark Cloud Cover"
+    elif third_close > third_open and prev_body <= third_body * 0.55 and close < open_price and close < (third_open + third_close) / 2:
+        warning = "Evening Star"
+
+    if not warning:
+        return None
+    return {
+        "type": warning,
+        "date": str(df.index[-1].date()) if hasattr(df.index[-1], "date") else str(df.index[-1]),
+        "plain": "Recent price action shows sellers stepping in near the high.",
+        "means": "The stock may need a short break before trying to move higher again.",
+        "action": "Consider waiting for a better entry. If you already own it for the long term, review your risk line calmly.",
+    }
+
+
+def momentum_score(
+    rsi_value: float | None,
+    macd_line: float | None,
+    signal_line: float | None,
+    histogram: float | None,
+    divergences: list[dict],
+    warnings: list[dict] | None = None,
+) -> int:
     score = 50
     if rsi_value is not None:
         if 50 < rsi_value <= 68:
@@ -142,6 +241,11 @@ def momentum_score(rsi_value: float | None, macd_line: float | None, signal_line
             score += 8
         elif divergence["type"].startswith("Bearish"):
             score -= 8
+    for warning in warnings or []:
+        if warning.get("category") == "momentum":
+            score -= 10
+        elif warning.get("category") == "candle":
+            score -= 7
     return max(0, min(100, round(score)))
 
 
@@ -157,14 +261,22 @@ def momentum_label(score: int) -> str:
 
 def plain_summary(result: dict) -> str:
     rsi_value = result.get("rsi")
-    rsi_text = result.get("rsi_interpretation", "Unavailable").lower()
-    macd_text = "MACD is supportive" if result.get("macd_trend") == "Bullish" else "MACD is not yet supportive"
-    divergence_text = ""
-    if result.get("divergences"):
-        latest = result["divergences"][-1]
-        divergence_text = f" {latest['type']} is present, so watch confirmation carefully."
-    rsi_piece = f"RSI {rsi_value:.1f} is {rsi_text}" if rsi_value is not None else "RSI is unavailable"
-    return f"{rsi_piece}; {macd_text}.{divergence_text}"
+    if rsi_value is None:
+        speed_text = "Momentum is unclear"
+    elif rsi_value > 70:
+        speed_text = "The recent climb may be getting stretched"
+    elif rsi_value >= 50:
+        speed_text = "Momentum is supportive"
+    elif rsi_value >= 40:
+        speed_text = "Momentum is neutral"
+    else:
+        speed_text = "Momentum needs improvement"
+    confirmation_text = "buying pressure is supportive" if result.get("macd_trend") == "Bullish" else "buying pressure is not fully confirmed yet"
+    warning_text = ""
+    if result.get("warnings"):
+        latest = result["warnings"][0]
+        warning_text = f" {latest['message']}"
+    return f"{speed_text}; {confirmation_text}.{warning_text}"
 
 
 def analyze_momentum(history: pd.DataFrame, pivots: list[Pivot] | list[dict] | None = None) -> dict:
@@ -180,6 +292,7 @@ def analyze_momentum(history: pd.DataFrame, pivots: list[Pivot] | list[dict] | N
     macd_trend = "Bullish" if current_macd is not None and current_signal is not None and current_macd > current_signal and current_macd > 0 else "Bearish / neutral"
 
     divergences: list[dict] = []
+    warnings: list[dict] = []
     if pivots:
         lows = pivot_rows(pivots, "low")
         highs = pivot_rows(pivots, "high")
@@ -192,8 +305,19 @@ def analyze_momentum(history: pd.DataFrame, pivots: list[Pivot] | list[dict] | N
             if bearish:
                 bearish["indicator"] = oscillator_name
                 divergences.append(bearish)
+        rsi_warning = detect_rsi_bearish_divergence(highs, rsi_series)
+        if rsi_warning:
+            item = warning(rsi_warning["plain"], rsi_warning["means"], rsi_warning["action"], label="Momentum is cooling", category="momentum")
+            item["code"] = rsi_warning["type"]
+            warnings.append(item)
 
-    score = momentum_score(current_rsi, current_macd, current_signal, current_histogram, divergences)
+    candle_warning = detect_bearish_reversal_candle(df)
+    if candle_warning:
+        item = warning(candle_warning["plain"], candle_warning["means"], candle_warning["action"], label="Time for a breather?", category="candle")
+        item["code"] = candle_warning["type"]
+        warnings.append(item)
+
+    score = momentum_score(current_rsi, current_macd, current_signal, current_histogram, divergences, warnings)
     result = {
         "rsi": current_rsi,
         "rsi_interpretation": rsi_interpretation(current_rsi),
@@ -202,6 +326,7 @@ def analyze_momentum(history: pd.DataFrame, pivots: list[Pivot] | list[dict] | N
         "macd_histogram": current_histogram,
         "macd_trend": macd_trend,
         "divergences": divergences,
+        "warnings": warnings,
         "score": score,
         "label": momentum_label(score),
     }

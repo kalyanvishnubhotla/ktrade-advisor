@@ -190,6 +190,8 @@ def init_db() -> None:
                 improve_to_buy TEXT,
                 buy_zone_explanation TEXT,
                 target_zone_explanation TEXT,
+                fresh_high_targets INTEGER DEFAULT 0,
+                fresh_high_target_note TEXT,
                 hold_window TEXT,
                 why_rating TEXT,
                 changes_view TEXT,
@@ -221,6 +223,31 @@ def init_db() -> None:
                 note TEXT,
                 UNIQUE(recommendation_id, window)
             );
+
+            CREATE TABLE IF NOT EXISTS recommendation_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ticker TEXT NOT NULL,
+              snapshot_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+              current_price REAL NOT NULL,
+              setup_quality INTEGER NOT NULL,
+              recommended_action TEXT NOT NULL,
+              buy_zone_low REAL,
+              buy_zone_high REAL,
+              risk_line REAL,
+              review_target1 REAL,
+              review_target2 REAL,
+              distance_to_buy_pct REAL,
+              signal_summary JSON,
+              full_signals JSON,
+              user_action TEXT,
+              user_action_date DATETIME,
+              actual_outcome_pct REAL,
+              hold_period_days INTEGER,
+              notes TEXT,
+              FOREIGN KEY (ticker) REFERENCES tickers(symbol)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_date ON recommendation_snapshots(ticker, snapshot_date DESC);
 
             CREATE TABLE IF NOT EXISTS research_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -324,6 +351,8 @@ def init_db() -> None:
             ("decision_reasons", "TEXT"),
             ("risk_reward_summary", "TEXT"),
             ("improve_to_buy", "TEXT"),
+            ("fresh_high_targets", "INTEGER DEFAULT 0"),
+            ("fresh_high_target_note", "TEXT"),
         ]:
             if column not in existing:
                 conn.execute(f"ALTER TABLE scores ADD COLUMN {column} {definition}")

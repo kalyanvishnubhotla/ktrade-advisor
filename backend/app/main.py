@@ -6,10 +6,11 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -20,6 +21,17 @@ from .fibonacci import cached_fib_zones
 from .market_data import refresh_all
 from .news import RSS_SOURCES, latest_news, news_for_ticker, refresh_news
 from .pivots import cached_pivots, major_swings
+from .recommendation_snapshots import (
+    calculate_accuracy_metrics,
+    get_history_for_ticker,
+    get_latest_snapshot,
+    get_learning_insights,
+    high_quality_accuracy_for_ticker,
+    mark_user_action,
+    record_outcome,
+    save_snapshot,
+    similar_setup_memory,
+)
 from .zones import cached_sr_zones, nearest_zones
 from .research import parse_research_signal
 
@@ -78,6 +90,20 @@ class SettingIn(BaseModel):
     value: str
 
 
+class SnapshotIn(BaseModel):
+    analysisResult: Dict[str, Any]
+
+
+class SnapshotActionIn(BaseModel):
+    action: str
+    notes: Optional[str] = None
+
+
+class SnapshotOutcomeIn(BaseModel):
+    actualOutcomePct: float
+    holdPeriodDays: Optional[int] = None
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -116,7 +142,8 @@ def dashboard() -> dict:
                        s.invalidation_level, s.target1, s.target2, s.distance_to_buy_zone, s.buy_zone_confluence,
                        s.setup_factor_scores, s.setup_positive_factors, s.setup_concern_factors,
                        s.decision_reasons, s.risk_reward_summary, s.improve_to_buy,
-                       s.buy_zone_explanation, s.target_zone_explanation, s.hold_window, s.why_rating, s.changes_view,
+                       s.buy_zone_explanation, s.target_zone_explanation, s.fresh_high_targets, s.fresh_high_target_note,
+                       s.hold_window, s.why_rating, s.changes_view,
                        (SELECT COUNT(*) FROM news_ticker_matches WHERE ticker_id = t.id) AS news_count,
                        (SELECT COUNT(*) FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id AND ni.sentiment = 'Positive') AS positive_news_count,
                        (SELECT COUNT(*) FROM news_ticker_matches ntm JOIN news_items ni ON ni.id = ntm.news_item_id WHERE ntm.ticker_id = t.id AND ni.sentiment = 'Negative') AS negative_news_count,
@@ -132,6 +159,8 @@ def dashboard() -> dict:
         )
         for card in cards:
             hydrate_setup_checklist(card)
+            card["similar_setup_memory"] = similar_setup_memory(card["symbol"], card.get("buy_zone_confluence") or card.get("score"))
+            card["historical_accuracy_70_plus"] = high_quality_accuracy_for_ticker(card["symbol"])
             if card.get("price"):
                 support_zone, resistance_zone = nearest_zones(card["ticker_id"], card["price"])
                 card["nearest_support_zone"] = support_zone
@@ -215,6 +244,67 @@ def refresh() -> dict:
 @app.post("/api/news/refresh")
 def refresh_news_endpoint() -> dict:
     return refresh_news()
+
+
+@app.post("/api/snapshots/{ticker}")
+def save_snapshot_endpoint(ticker: str, payload: SnapshotIn) -> dict:
+    save_snapshot(ticker, payload.analysisResult)
+    return {"ok": True}
+
+
+@app.post("/api/snapshots/{ticker}/track-current")
+def track_current_snapshot_endpoint(ticker: str) -> dict:
+    symbol = ticker.strip().upper().replace(" ", "")
+    with db() as conn:
+        ticker_row = conn.execute("SELECT * FROM tickers WHERE symbol = ?", (symbol,)).fetchone()
+        if not ticker_row:
+            raise HTTPException(404, "Ticker not found")
+        ticker_id = ticker_row["id"]
+        indicators = conn.execute("SELECT * FROM indicators WHERE ticker_id = ?", (ticker_id,)).fetchone()
+        score = conn.execute("SELECT * FROM scores WHERE ticker_id = ? ORDER BY as_of DESC LIMIT 1", (ticker_id,)).fetchone()
+        if not indicators or not score:
+            raise HTTPException(400, "Refresh this ticker before tracking a decision")
+        payload = {
+            "indicators": dict(indicators),
+            "score": dict(score),
+            "pivots": cached_pivots(ticker_id),
+            "fib_zones": cached_fib_zones(ticker_id),
+            "sr_zones": cached_sr_zones(ticker_id),
+        }
+    save_snapshot(symbol, payload)
+    return {"ok": True, "message": "Decision snapshot saved."}
+
+
+@app.get("/api/snapshots/{ticker}/latest")
+def latest_snapshot_endpoint(ticker: str) -> Optional[dict]:
+    return get_latest_snapshot(ticker)
+
+
+@app.get("/api/snapshots/{ticker}")
+def snapshot_history_endpoint(ticker: str, limit: int = 50) -> list[dict]:
+    return get_history_for_ticker(ticker, limit)
+
+
+@app.patch("/api/snapshots/{snapshot_id}/action")
+def snapshot_action_endpoint(snapshot_id: int, payload: SnapshotActionIn) -> dict:
+    mark_user_action(snapshot_id, payload.action, payload.notes)
+    return {"ok": True}
+
+
+@app.patch("/api/snapshots/{snapshot_id}/outcome")
+def snapshot_outcome_endpoint(snapshot_id: int, payload: SnapshotOutcomeIn) -> dict:
+    record_outcome(snapshot_id, payload.actualOutcomePct, payload.holdPeriodDays)
+    return {"ok": True}
+
+
+@app.get("/api/snapshots/metrics/accuracy")
+def snapshot_accuracy_endpoint(ticker: Optional[str] = None) -> dict:
+    return calculate_accuracy_metrics(ticker)
+
+
+@app.get("/api/snapshots/insights/learning")
+def snapshot_learning_insights_endpoint(ticker: Optional[str] = None, daysBack: int = 90) -> dict:
+    return get_learning_insights(ticker, daysBack)
 
 
 @app.get("/api/news")
@@ -329,8 +419,9 @@ def add_ticker(watchlist_id: int, payload: TickerIn) -> dict:
 
 @app.get("/api/tickers/{symbol}")
 def ticker_detail(symbol: str) -> dict:
+    normalized_symbol = symbol.upper().replace(" ", "")
     with db() as conn:
-        ticker = conn.execute("SELECT * FROM tickers WHERE symbol = ?", (symbol.upper(),)).fetchone()
+        ticker = conn.execute("SELECT * FROM tickers WHERE symbol = ?", (normalized_symbol,)).fetchone()
         if not ticker:
             raise HTTPException(404, "Ticker not found")
         ticker_id = ticker["id"]
@@ -358,6 +449,8 @@ def ticker_detail(symbol: str) -> dict:
         "research": research,
         "news": news_for_ticker(ticker_id),
         "recommendations": recommendations,
+        "historical_accuracy_70_plus": high_quality_accuracy_for_ticker(normalized_symbol),
+        "similar_setup_memory": similar_setup_memory(normalized_symbol, scores[0].get("buy_zone_confluence") or scores[0].get("score") if scores else None),
     }
 
 
@@ -567,6 +660,10 @@ async def import_positions(file: UploadFile) -> dict:
 
 frontend_dist = ROOT / "frontend" / "dist"
 if frontend_dist.exists():
+    @app.get("/learning-insights")
+    def learning_insights_page() -> FileResponse:
+        return FileResponse(frontend_dist / "index.html")
+
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
 
 

@@ -9,6 +9,7 @@ import pandas as pd
 
 from .confluence import build_confluence_checklist
 from .momentum import analyze_momentum
+from .plain_english import translate_score, warning as plain_warning
 from .trend_volume import analyze_trend_volume
 
 
@@ -101,6 +102,7 @@ def compute_indicators(history: pd.DataFrame, spy_history: pd.DataFrame | None =
         "momentum_score": momentum.get("score"),
         "momentum_summary": momentum.get("summary"),
         "momentum_divergence": ", ".join([f"{item.get('indicator')} {item.get('type')}" for item in momentum.get("divergences", [])]) or None,
+        "momentum_warnings": momentum.get("warnings") or [],
         "adx": clean_float(trend_volume.get("adx")),
         "plus_di": clean_float(trend_volume.get("plus_di")),
         "minus_di": clean_float(trend_volume.get("minus_di")),
@@ -199,7 +201,7 @@ def risk_reward_at_buy_area(entry_low: float, entry_high: float, invalidation: f
 
 
 def improve_to_buy_trigger(decision: str, entry_low: float, entry_high: float, rsi: float, volume_label: str, trend_label: str) -> str:
-    rsi_trigger = "RSI cools below 55" if rsi >= 55 else "RSI stays constructive"
+    rsi_trigger = "momentum cools a bit" if rsi >= 55 else "momentum stays constructive"
     volume_trigger = "volume stays supportive" if volume_label in ["Supportive", "Constructive", "Strong", "Good"] else "volume improves"
     if decision == "Buy-worthy now":
         return f"Already qualifies. Cleaner entry would be a pullback toward ${entry_low:.2f}-${entry_high:.2f} while {volume_trigger}."
@@ -212,6 +214,87 @@ def improve_to_buy_trigger(decision: str, entry_low: float, entry_high: float, r
     if trend_label in ["Weak", "Mixed"]:
         return f"Trend improves, price holds ${entry_low:.2f}-${entry_high:.2f}, and {volume_trigger}."
     return f"Price gets closer to ${entry_low:.2f}-${entry_high:.2f}, {rsi_trigger}, and {volume_trigger}."
+
+
+def fresh_high_target_note() -> str:
+    return (
+        "Because this stock is at fresh highs, we use special targets based on how strong the move has been. "
+        "These are not guarantees — just helpful guideposts."
+    )
+
+
+def days_until(date_text: str | None) -> int | None:
+    if not date_text:
+        return None
+    try:
+        target = datetime.fromisoformat(str(date_text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    today = datetime.now(timezone.utc).date()
+    return (target.date() - today).days
+
+
+def context_warnings(ind: dict) -> list[dict]:
+    warnings: list[dict] = []
+    rsi = ind.get("rsi")
+    if rsi is not None and rsi > 70:
+        warnings.append(
+            plain_warning(
+                "Price has climbed quickly.",
+                "It may pause or pull back a bit to rest.",
+                "Good to hold if you own it. New buyers may wait for a small dip.",
+                label="Healthy but fast move",
+                category="regime",
+            )
+        )
+
+    earnings_days = days_until(ind.get("earnings_date"))
+    if earnings_days is not None:
+        if 0 <= earnings_days <= 14:
+            warnings.append(
+                plain_warning(
+                    f"Earnings are coming in {earnings_days} day{'s' if earnings_days != 1 else ''}.",
+                    "Stocks can move more than usual around earnings.",
+                    "Good to hold if you own it. New buyers may wait until the earnings move settles.",
+                    label="Watch closely around earnings",
+                    category="catalyst",
+                )
+            )
+        elif -5 <= earnings_days < 0:
+            warnings.append(
+                plain_warning(
+                    "The stock recently moved through earnings.",
+                    "After big earnings, stocks often take a short break.",
+                    "Good to hold if you own it. New buyers may wait for a calmer entry.",
+                    label="Time for a breather?",
+                    category="catalyst",
+                )
+            )
+
+    month = datetime.now(timezone.utc).month
+    if month == 6:
+        warnings.append(
+            plain_warning(
+                "June can be a choppy month.",
+                "Clean entries can matter a little more.",
+                "Good to hold if you own it. New buyers may wait for a small dip.",
+                label="Market season can be uneven",
+                category="seasonality",
+            )
+        )
+    elif month == 9:
+        warnings.append(
+            plain_warning(
+                "September can be uneven for the market.",
+                "Being selective can help avoid rushed entries.",
+                "Good to hold if you own it. New buyers may wait for a small dip.",
+                label="Market season can be uneven",
+                category="seasonality",
+            )
+        )
+    return warnings[:3]
 
 
 def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3, zone_context: dict | None = None) -> dict:
@@ -236,6 +319,10 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     demand_zone = zone_context.get("buy_zone")
     supply_zones = zone_context.get("target_zones") or []
     fib_extensions = zone_context.get("fib_extensions") or {}
+    fresh_high_targets = bool(fib_extensions.get("fresh_high"))
+    warning_items = (ind.get("momentum_warnings") or []) + context_warnings(ind)
+    warning_messages = [item.get("message") for item in warning_items if item.get("message")]
+    warning_actions = [item.get("action") for item in warning_items if item.get("action")]
 
     trend = 0
     if trend_quality is not None:
@@ -299,6 +386,11 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     risk_reward = max(0, min(10, risk_reward))
 
     score = round(trend + momentum + volume + sr + pattern + news + risk_reward + portfolio_fit)
+    if warning_items:
+        penalty = 0
+        for item in warning_items:
+            penalty += 4 if item.get("category") in ["momentum", "candle", "regime"] else 2
+        score = max(0, score - min(10, penalty))
     if score >= 80:
         band = "Strong opportunity"
     elif score >= 65:
@@ -314,6 +406,8 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         distance_to_buy_zone = max(0, (price / demand_zone["price_high"] - 1) * 100)
     checklist = build_confluence_checklist(ind, demand_zone, distance_to_buy_zone)
     setup_quality = checklist["total"]
+    if warning_items:
+        setup_quality = max(0, setup_quality - min(12, 4 * len(warning_items)))
 
     if score >= 78 and risk != "High" and (distance_to_buy_zone is None or distance_to_buy_zone <= 3):
         decision = "Buy-worthy now"
@@ -363,6 +457,16 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         summary = f"The evidence is mixed: {trend_phrase}, momentum is {momentum_label.lower()}, and {target_phrase}. New buying does not look urgent."
         action = "Hold or wait for a clearer setup."
 
+    if warning_messages:
+        gentle_warning = warning_messages[0]
+        if decision == "Buy-worthy now":
+            decision = "Hold / no action"
+            summary = f"{gentle_warning} The setup can still be okay to hold, but a calmer entry may be better for new buying."
+            action = warning_actions[0] if warning_actions else "Consider waiting for a better entry."
+        elif decision in ["Hold / no action", "Wait for better price", "Watch for breakout"]:
+            summary = f"{summary} {gentle_warning}"
+            action = warning_actions[0] if warning_actions else action
+
     if demand_zone:
         entry_low = demand_zone["price_low"]
         entry_high = demand_zone["price_high"]
@@ -373,7 +477,10 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         entry_high = min(price * 1.02, support * 1.08) if support else price * 1.02
         invalidation = support * 0.97 if support else price * 0.92
 
-    if supply_zones:
+    if fresh_high_targets and fib_extensions.get("1.272") and fib_extensions.get("1.618"):
+        target1 = fib_extensions["1.272"]
+        target2 = fib_extensions["1.618"]
+    elif supply_zones:
         first_supply = supply_zones[0]
         target1 = first_supply["price_high"] if first_supply["price_low"] <= price <= first_supply["price_high"] else first_supply["price_low"]
         target2 = supply_zones[1]["price_low"] if len(supply_zones) > 1 else first_supply["price_high"]
@@ -387,10 +494,26 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         target2 = fib_extensions["1.618"]
 
     decision_reasons = build_decision_reasons(checklist, trend_label, momentum_label, volume_label, risk)
+    concerns = list(checklist["concern_factors"])
+    for message in warning_messages:
+        if message not in concerns:
+            concerns.insert(0, message)
+    concerns = concerns[:3]
     risk_reward_summary = risk_reward_at_buy_area(entry_low, entry_high, invalidation, target1)
     improve_trigger = improve_to_buy_trigger(decision, entry_low, entry_high, rsi, volume_label, trend_label)
+    if fresh_high_targets:
+        if decision in ["Buy-worthy now", "Watch for breakout"]:
+            improve_trigger = (
+                f"Uptrend stays strong, price holds above the preferred area, and volume remains healthy. "
+                f"Next possible target if momentum continues: ${target1:.2f}."
+            )
+        else:
+            improve_trigger = (
+                f"Price either rests calmly near ${entry_low:.2f}-${entry_high:.2f}, or the uptrend stays strong with healthy volume. "
+                f"Realistic review area if the uptrend stays strong: ${target1:.2f}."
+            )
 
-    return {
+    result = {
         "score": score,
         "band": band,
         "decision": decision,
@@ -414,16 +537,22 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
         "buy_zone_confluence": setup_quality,
         "setup_factor_scores": checklist["factors"],
         "setup_positive_factors": checklist["positive_factors"],
-        "setup_concern_factors": checklist["concern_factors"],
+        "setup_concern_factors": concerns,
         "decision_reasons": decision_reasons,
         "risk_reward_summary": risk_reward_summary,
         "improve_to_buy": improve_trigger,
         "buy_zone_explanation": demand_zone.get("plain_english") if demand_zone else None,
-        "target_zone_explanation": supply_zones[0].get("plain_english") if supply_zones else None,
+        "target_zone_explanation": fresh_high_target_note() if fresh_high_targets else supply_zones[0].get("plain_english") if supply_zones else None,
+        "fresh_high_targets": fresh_high_targets,
+        "fresh_high_target_note": fresh_high_target_note() if fresh_high_targets else None,
         "hold_window": "4-8 weeks for a swing setup; longer only if fundamentals still fit.",
         "why_rating": f"Trend is {trend_label.lower()}, momentum is {momentum_label.lower()}, volume is {volume_label.lower()}, research is {news_label.lower()}, and risk is {risk.lower()}.",
         "changes_view": "A break below the risk level, weakening market, negative research, or heavy selling would lower the rating.",
+        "warning_messages": warning_messages,
+        "warning_actions": warning_actions,
+        "context_warnings": warning_items,
     }
+    return translate_score(result)
 
 
 def market_condition(spy: dict | None, qqq: dict | None) -> MarketCondition:
