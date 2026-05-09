@@ -8,9 +8,11 @@ import pandas as pd
 from .analysis import compute_indicators, market_condition
 from .database import db, rows_to_dicts, upsert_ticker
 from .fibonacci import cache_fib_zones
+from .market_regime import analyze_market_regime
 from .news import refresh_news
 from .pivots import cache_pivots
 from .recommendation_snapshots import save_snapshot
+from .sector_relative_strength import get_sector_etf
 from .technical_zone_analyzer import TechnicalZoneAnalyzer
 from .zones import cache_sr_zones
 
@@ -28,9 +30,18 @@ def refresh_all() -> dict:
 
     spy_history, _ = fetch_history("SPY")
     qqq_history, _ = fetch_history("QQQ")
+    iwm_history, _ = fetch_history("IWM")
     spy_ind = compute_indicators(spy_history)
     qqq_ind = compute_indicators(qqq_history)
+    iwm_ind = compute_indicators(iwm_history)
     market = market_condition(spy_ind, qqq_ind)
+
+    # Compute market regime once for all tickers (VIX fetch happens inside)
+    regime_data = analyze_market_regime(spy_ind=spy_ind, qqq_ind=qqq_ind, iwm_ind=iwm_ind)
+
+    # Pre-fetch sector ETF histories to share across tickers in same sector
+    sector_etf_cache: dict[str, pd.DataFrame] = {}
+
     analyzer = TechnicalZoneAnalyzer(period="2y")
 
     for ticker in tickers:
@@ -40,7 +51,29 @@ def refresh_all() -> dict:
                 signals = rows_to_dicts(
                     conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at", (ticker["id"],)).fetchall()
                 )
-            analysis = analyzer.analyze(symbol, spy_history=spy_history, research_signals=signals)
+            # Fetch sector ETF history (cached per ETF symbol across tickers)
+            sector_etf_hist: pd.DataFrame | None = None
+            try:
+                # Quick info fetch just to get sector name before full analyze()
+                import yfinance as _yf
+                _raw = _yf.Ticker(symbol).get_info()
+                _sector = _raw.get("sector")
+                _etf_sym = get_sector_etf(_sector)
+                if _etf_sym:
+                    if _etf_sym not in sector_etf_cache:
+                        _etf_hist, _ = fetch_history(_etf_sym)
+                        sector_etf_cache[_etf_sym] = _etf_hist
+                    sector_etf_hist = sector_etf_cache[_etf_sym]
+            except Exception:
+                pass
+
+            analysis = analyzer.analyze(
+                symbol,
+                spy_history=spy_history,
+                research_signals=signals,
+                regime_data=regime_data,
+                sector_etf_history=sector_etf_hist,
+            )
             try:
                 save_snapshot(symbol, analysis)
                 snapshots_saved += 1
@@ -85,8 +118,10 @@ def refresh_all() -> dict:
                      rising_volume_on_up_days, trend_alignment, trend_strength_score, trend_strength_label, trend_strength_summary,
                      volume_confirmation, volume_confirmation_score, volume_confirmation_summary,
                      atr, volume_ratio, relative_strength,
-                     support, resistance, distance_to_support, distance_to_resistance, pattern_signal, earnings_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     support, resistance, distance_to_support, distance_to_resistance, pattern_signal, earnings_date,
+                     earnings_signal_json, sector_rs_signal_json, regime_signal_json,
+                     insider_signal_json, fundamentals_signal_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ticker["id"],
@@ -132,6 +167,29 @@ def refresh_all() -> dict:
                         ind.get("distance_to_resistance"),
                         ind.get("pattern_signal"),
                         ind.get("earnings_date"),
+                        # New signal JSON blobs
+                        json.dumps({k: ind.get(k) for k in [
+                            "days_to_earnings", "earnings_score_modifier",
+                            "earnings_label", "earnings_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "sector_etf", "sector_rs_13w", "sector_rs_26w", "sector_rs_52w",
+                            "sector_rs_score_modifier", "sector_rs_label", "sector_rs_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "regime_label", "regime_vix", "regime_breadth_score",
+                            "regime_score_modifier", "regime_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "insider_buy_count", "insider_sell_count", "insider_net_value",
+                            "insider_score_modifier", "insider_label", "insider_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "fundamentals_pe", "fundamentals_revenue_growth",
+                            "fundamentals_profit_margin", "fundamentals_debt_to_equity",
+                            "fundamentals_eps_growth", "fundamentals_score_modifier",
+                            "fundamentals_label", "fundamentals_summary",
+                        ]}),
                     ),
                 )
                 as_of = datetime.now(timezone.utc).isoformat()

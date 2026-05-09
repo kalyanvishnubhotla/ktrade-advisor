@@ -386,6 +386,20 @@ def score_ticker(ind: dict, research_signals: list[dict], portfolio_fit: int = 3
     risk_reward = max(0, min(10, risk_reward))
 
     score = round(trend + momentum + volume + sr + pattern + news + risk_reward + portfolio_fit)
+
+    # ── Apply new signal modifiers (Weeks 3–4 signals) ────────────────────
+    # Each modifier is capped inside its own module; here we cap the combined
+    # effect to prevent runaway adjustments.
+    earnings_mod = ind.get("earnings_score_modifier") or 0
+    sector_rs_mod = ind.get("sector_rs_score_modifier") or 0
+    regime_mod = ind.get("regime_score_modifier") or 0
+    insider_mod = ind.get("insider_score_modifier") or 0
+    fundamentals_mod = ind.get("fundamentals_score_modifier") or 0
+    signal_modifier = earnings_mod + sector_rs_mod + regime_mod + insider_mod + fundamentals_mod
+    # Cap aggregate modifier: max boost +15, max penalty -20
+    signal_modifier = max(-20, min(15, signal_modifier))
+    score = max(0, min(100, score + signal_modifier))
+
     if warning_items:
         penalty = 0
         for item in warning_items:

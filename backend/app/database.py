@@ -331,6 +331,12 @@ def init_db() -> None:
             ("bb_upper", "REAL"),
             ("bb_lower", "REAL"),
             ("bb_width_pct", "REAL"),
+            # Week 3-4 signal columns (JSON blobs)
+            ("earnings_signal_json", "TEXT"),
+            ("sector_rs_signal_json", "TEXT"),
+            ("regime_signal_json", "TEXT"),
+            ("insider_signal_json", "TEXT"),
+            ("fundamentals_signal_json", "TEXT"),
         ]:
             if column not in indicator_existing:
                 conn.execute(f"ALTER TABLE indicators ADD COLUMN {column} {definition}")
