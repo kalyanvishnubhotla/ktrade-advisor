@@ -133,6 +133,75 @@ function SignalHealthGrid({ card }: { card: Card }) {
   );
 }
 
+// ── SignalIntelBadges — shows the 5 new signal badges ────────────────────────
+function signalModifierTone(mod?: number): string {
+  if (mod === undefined || mod === null) return 'yellow';
+  if (mod >= 5) return 'green';
+  if (mod >= 1) return 'green';
+  if (mod === 0) return 'yellow';
+  if (mod >= -4) return 'yellow';
+  return 'red';
+}
+
+function SignalIntelBadges({ card }: { card: Card }) {
+  const badges: Array<{ label: string; value: string; mod?: number; help: string }> = [];
+
+  if (card.earnings_label && card.earnings_label !== 'No earnings signal') {
+    badges.push({
+      label: 'Earnings',
+      value: card.earnings_label,
+      mod: card.earnings_score_modifier,
+      help: card.earnings_summary || 'No detail available.',
+    });
+  }
+  if (card.regime_label && card.regime_label !== 'Unknown') {
+    badges.push({
+      label: 'Market',
+      value: card.regime_label,
+      mod: card.regime_score_modifier,
+      help: card.regime_summary || 'No detail available.',
+    });
+  }
+  if (card.sector_rs_label && card.sector_rs_label !== 'No sector data') {
+    badges.push({
+      label: 'Sector RS',
+      value: card.sector_rs_label,
+      mod: card.sector_rs_score_modifier,
+      help: card.sector_rs_summary || 'No detail available.',
+    });
+  }
+  if (card.insider_label && card.insider_label !== 'No recent activity') {
+    badges.push({
+      label: 'Insiders',
+      value: card.insider_label,
+      mod: card.insider_score_modifier,
+      help: card.insider_summary || 'No detail available.',
+    });
+  }
+  if (card.fundamentals_label && card.fundamentals_label !== 'No data' && card.fundamentals_label !== 'N/A') {
+    badges.push({
+      label: 'Fundamentals',
+      value: card.fundamentals_label,
+      mod: card.fundamentals_score_modifier,
+      help: card.fundamentals_summary || 'No detail available.',
+    });
+  }
+
+  if (badges.length === 0) return null;
+
+  return (
+    <div className="signal-grid" style={{ marginTop: 6 }}>
+      {badges.map((b) => (
+        <span className={`signal-pill ${signalModifierTone(b.mod)}`} key={b.label}>
+          <i aria-hidden="true" />
+          <b>{b.label}</b>{b.value}
+          <HelpIcon text={b.help} />
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // ── TickerCard ────────────────────────────────────────────────────────────────
 function TickerCard({ card, showHelp, onSelect, onTrack }: {
   card: Card; showHelp: boolean;
@@ -185,6 +254,9 @@ function TickerCard({ card, showHelp, onSelect, onTrack }: {
 
       {/* Signal health */}
       <SignalHealthGrid card={card} />
+
+      {/* Intelligence signals (earnings, regime, sector RS, insider, fundamentals) */}
+      <SignalIntelBadges card={card} />
 
       {/* Zone plan */}
       <div className="zone-plan">
@@ -1023,6 +1095,40 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
                 <DetailStat label="Confidence" value={score?.confidence} />
               </div>
             </article>
+
+            {/* Intelligence Signals */}
+            {(indicators?.earnings_label || indicators?.regime_label || indicators?.sector_rs_label || indicators?.insider_label || indicators?.fundamentals_label) && (
+              <article className="panel panel-sm">
+                <h3>Intelligence Signals</h3>
+                <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-2)' }}>
+                  Five additional signals that adjust the score beyond price technicals.
+                </p>
+                <SignalIntelBadges card={{ ...score, ...indicators } as Card} />
+                <div className="detail-stat-grid" style={{ marginTop: 'var(--space-3)' }}>
+                  {indicators?.earnings_label && <DetailStat label="Earnings" value={indicators.earnings_label} />}
+                  {indicators?.days_to_earnings != null && (
+                    <DetailStat label="Days to earnings" value={String(indicators.days_to_earnings)} />
+                  )}
+                  {indicators?.regime_label && <DetailStat label="Market regime" value={indicators.regime_label} />}
+                  {indicators?.regime_vix != null && <DetailStat label="VIX" value={String(indicators.regime_vix)} />}
+                  {indicators?.sector_rs_label && <DetailStat label="Sector RS" value={indicators.sector_rs_label} />}
+                  {indicators?.sector_etf && <DetailStat label="Sector ETF" value={indicators.sector_etf} />}
+                  {indicators?.sector_rs_13w != null && <DetailStat label="RS 13-week" value={`${indicators.sector_rs_13w > 0 ? '+' : ''}${indicators.sector_rs_13w.toFixed(1)}%`} />}
+                  {indicators?.insider_label && <DetailStat label="Insiders" value={indicators.insider_label} />}
+                  {indicators?.insider_buy_count != null && <DetailStat label="Insider buys" value={String(indicators.insider_buy_count)} />}
+                  {indicators?.fundamentals_label && <DetailStat label="Fundamentals" value={indicators.fundamentals_label} />}
+                  {indicators?.fundamentals_pe != null && <DetailStat label="P/E ratio" value={String(indicators.fundamentals_pe)} />}
+                  {indicators?.fundamentals_revenue_growth != null && <DetailStat label="Revenue growth" value={`${indicators.fundamentals_revenue_growth > 0 ? '+' : ''}${indicators.fundamentals_revenue_growth.toFixed(1)}%`} />}
+                  {indicators?.fundamentals_profit_margin != null && <DetailStat label="Profit margin" value={`${indicators.fundamentals_profit_margin.toFixed(1)}%`} />}
+                </div>
+                {indicators?.fundamentals_summary && (
+                  <p style={{ marginTop: 'var(--space-2)', fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>{indicators.fundamentals_summary}</p>
+                )}
+                {indicators?.earnings_summary && (
+                  <p style={{ marginTop: 'var(--space-2)', fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>{indicators.earnings_summary}</p>
+                )}
+              </article>
+            )}
 
             {/* Why this action */}
             <article className="panel panel-sm">

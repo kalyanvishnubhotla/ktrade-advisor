@@ -7,9 +7,13 @@ import pandas as pd
 import yfinance as yf
 
 from .analysis import compute_indicators, score_ticker
+from .earnings_intelligence import analyze_earnings, fetch_eps_surprise_avg
 from .fibonacci import FibSetup, FibZone, calculate_fib_extensions, calculate_recent_fib_zones
+from .fundamentals import analyze_fundamentals
+from .insider_transactions import analyze_insider_activity, fetch_insider_transactions
 from .momentum import analyze_momentum
 from .pivots import Pivot, detect_multi_timeframe_pivots, major_swings, nearest_support_resistance
+from .sector_relative_strength import analyze_sector_rs
 from .zones import SRZone, calculate_sr_zones, recommendation_zones
 
 
@@ -38,16 +42,31 @@ class TechnicalZoneAnalyzer:
     def fetch_latest_data(self, symbol: str) -> tuple[pd.DataFrame, dict]:
         ticker = yf.Ticker(symbol)
         history = ticker.history(period=self.period, auto_adjust=False)
-        info = {}
+        info: dict = {}
         try:
             raw_info = ticker.get_info()
+            asset_type = "etf" if raw_info.get("quoteType") == "ETF" else "stock"
             info = {
                 "company": raw_info.get("shortName") or raw_info.get("longName"),
-                "asset_type": "etf" if raw_info.get("quoteType") == "ETF" else "stock",
+                "asset_type": asset_type,
+                # Sector (used by sector_relative_strength)
+                "sector": raw_info.get("sector"),
+                # Fundamentals raw fields (used by fundamentals module)
+                "_raw_info": raw_info,
             }
             earnings_date = self.next_earnings_date(ticker)
             if earnings_date:
                 info["earnings_date"] = earnings_date
+            # EPS surprise average (used by earnings_intelligence)
+            try:
+                info["eps_surprise_avg"] = fetch_eps_surprise_avg(symbol)
+            except Exception:
+                info["eps_surprise_avg"] = None
+            # Insider transactions DataFrame
+            try:
+                info["_insider_df"] = ticker.insider_transactions
+            except Exception:
+                info["_insider_df"] = None
         except Exception:
             info = {}
         return history, info
@@ -90,6 +109,8 @@ class TechnicalZoneAnalyzer:
         history: pd.DataFrame | None = None,
         spy_history: pd.DataFrame | None = None,
         research_signals: list[dict] | None = None,
+        regime_data: dict | None = None,
+        sector_etf_history: pd.DataFrame | None = None,
     ) -> TechnicalZoneAnalysis:
         if history is None:
             history, info = self.fetch_latest_data(symbol)
@@ -102,6 +123,53 @@ class TechnicalZoneAnalyzer:
         indicators = compute_indicators(history, spy_history)
         if info.get("earnings_date"):
             indicators["earnings_date"] = info["earnings_date"]
+
+        # ── New signal modules ─────────────────────────────────────────────
+        # 1. Earnings Intelligence
+        try:
+            earnings_sig = analyze_earnings(
+                earnings_date=info.get("earnings_date"),
+                eps_surprise_avg=info.get("eps_surprise_avg"),
+            )
+            indicators.update(earnings_sig)
+        except Exception:
+            pass
+
+        # 2. Sector Relative Strength
+        try:
+            sector_sig = analyze_sector_rs(
+                ticker_history=history,
+                sector=info.get("sector"),
+                sector_etf_history=sector_etf_history,
+            )
+            indicators.update(sector_sig)
+        except Exception:
+            pass
+
+        # 3. Market Regime (use pre-computed if available)
+        try:
+            if regime_data:
+                indicators.update(regime_data)
+            # If not provided, regime_data will be computed in market_data.py and merged later
+        except Exception:
+            pass
+
+        # 4. Insider Transactions
+        try:
+            insider_sig = analyze_insider_activity(info.get("_insider_df"))
+            indicators.update(insider_sig)
+        except Exception:
+            pass
+
+        # 5. Fundamentals Quality
+        try:
+            fund_sig = analyze_fundamentals(
+                info=info.get("_raw_info") or {},
+                asset_type=info.get("asset_type", "stock"),
+            )
+            indicators.update(fund_sig)
+        except Exception:
+            pass
         pivots: list[Pivot] = []
         fib_setup: FibSetup | None = None
         fib_zones: list[FibZone] = []

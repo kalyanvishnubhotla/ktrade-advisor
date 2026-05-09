@@ -136,6 +136,8 @@ def dashboard() -> dict:
                        i.macd_trend AS indicator_macd_trend, i.momentum_score, i.momentum_divergence,
                        i.adx, i.adx_interpretation, i.trend_alignment, i.trend_strength_score, i.trend_strength_summary,
                        i.obv_trend, i.volume_vs_20d, i.rising_volume_on_up_days, i.volume_confirmation, i.volume_confirmation_summary,
+                       i.earnings_signal_json, i.sector_rs_signal_json, i.regime_signal_json,
+                       i.insider_signal_json, i.fundamentals_signal_json,
                        s.score, s.decision, s.confidence, s.risk, s.trend_label, s.momentum_label,
                        s.trend_strength_summary AS score_trend_strength_summary, s.momentum_summary, s.macd_trend, s.volume_label,
                        s.volume_confirmation_summary AS score_volume_confirmation_summary,
@@ -160,6 +162,7 @@ def dashboard() -> dict:
         )
         for card in cards:
             hydrate_setup_checklist(card)
+            hydrate_signal_blobs(card)
             card["similar_setup_memory"] = similar_setup_memory(card["symbol"], card.get("buy_zone_confluence") or card.get("score"))
             card["historical_accuracy_70_plus"] = high_quality_accuracy_for_ticker(card["symbol"])
             if card.get("price"):
@@ -206,6 +209,29 @@ def hydrate_setup_checklist(item: dict) -> None:
     item["setup_positive_factors"] = parse_json_list(item.get("setup_positive_factors"))
     item["setup_concern_factors"] = parse_json_list(item.get("setup_concern_factors"))
     item["decision_reasons"] = parse_json_list(item.get("decision_reasons"))
+
+
+def _parse_json_dict(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def hydrate_signal_blobs(item: dict) -> None:
+    """Unpack the 5 new signal JSON blobs into flat keys on the card/indicator dict."""
+    for key in [
+        "earnings_signal_json",
+        "sector_rs_signal_json",
+        "regime_signal_json",
+        "insider_signal_json",
+        "fundamentals_signal_json",
+    ]:
+        blob = _parse_json_dict(item.pop(key, None))
+        item.update(blob)
 
 
 def watchlist_summary(conn) -> list[dict]:
@@ -438,10 +464,14 @@ def ticker_detail(symbol: str) -> dict:
         pivots = cached_pivots(ticker_id)
         fib_zones = cached_fib_zones(ticker_id)
         sr_zones = cached_sr_zones(ticker_id)
+    ind_dict = dict(indicators) if indicators else None
+    if ind_dict:
+        hydrate_signal_blobs(ind_dict)
+
     return {
         "ticker": dict(ticker),
         "prices": list(reversed(prices)),
-        "indicators": dict(indicators) if indicators else None,
+        "indicators": ind_dict,
         "pivots": pivots,
         "major_pivots": major_swings(pivots),
         "fib_zones": fib_zones,

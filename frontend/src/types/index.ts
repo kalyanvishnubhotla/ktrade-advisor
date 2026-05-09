@@ -91,6 +91,42 @@ export type Card = {
   latest_news_link?: string;
   nearest_support_zone?: SRZone | null;
   nearest_resistance_zone?: SRZone | null;
+  // Week 3–4: New signal fields
+  // Earnings Intelligence
+  days_to_earnings?: number | null;
+  earnings_score_modifier?: number;
+  earnings_label?: string;
+  earnings_summary?: string;
+  // Sector Relative Strength
+  sector_etf?: string | null;
+  sector_rs_13w?: number | null;
+  sector_rs_26w?: number | null;
+  sector_rs_52w?: number | null;
+  sector_rs_score_modifier?: number;
+  sector_rs_label?: string;
+  sector_rs_summary?: string;
+  // Market Regime
+  regime_label?: string;
+  regime_vix?: number | null;
+  regime_breadth_score?: number;
+  regime_score_modifier?: number;
+  regime_summary?: string;
+  // Insider Transactions
+  insider_buy_count?: number;
+  insider_sell_count?: number;
+  insider_net_value?: number;
+  insider_score_modifier?: number;
+  insider_label?: string;
+  insider_summary?: string;
+  // Fundamentals
+  fundamentals_pe?: number | null;
+  fundamentals_revenue_growth?: number | null;
+  fundamentals_profit_margin?: number | null;
+  fundamentals_debt_to_equity?: number | null;
+  fundamentals_eps_growth?: number | null;
+  fundamentals_score_modifier?: number;
+  fundamentals_label?: string;
+  fundamentals_summary?: string;
 };
 
 export type NewsItem = {
