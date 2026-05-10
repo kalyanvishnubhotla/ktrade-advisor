@@ -696,6 +696,223 @@ async def import_positions(file: UploadFile) -> dict:
     return {"imported": imported}
 
 
+# ── Portfolio OS — import endpoint ────────────────────────────────────────────
+
+class PortfolioImportIn(BaseModel):
+    transactions: list[Dict[str, Any]]
+
+
+def _recalculate_holding(conn, symbol: str) -> bool:
+    """
+    Recompute portfolio_holdings for a single symbol from all its stored
+    transactions using the **average cost method**.
+
+    Returns True if this is a brand-new holding (didn't exist before this call).
+    """
+    is_new = conn.execute(
+        "SELECT 1 FROM portfolio_holdings WHERE symbol = ?", (symbol,)
+    ).fetchone() is None
+
+    txns = rows_to_dicts(
+        conn.execute(
+            "SELECT * FROM portfolio_transactions WHERE symbol = ? ORDER BY transaction_date, id",
+            (symbol,),
+        ).fetchall()
+    )
+
+    qty: float = 0.0
+    avg_cost: float = 0.0
+    total_cost: float = 0.0
+    sources: set[str] = set()
+    last_date: str | None = None
+
+    for txn in txns:
+        broker = txn.get("broker") or ""
+        if broker:
+            sources.add(broker)
+        last_date = txn.get("transaction_date") or last_date
+
+        t_type = txn.get("type") or "Other"
+        t_qty   = abs(float(txn.get("quantity") or 0))
+        t_price = txn.get("price")
+        t_amount = txn.get("amount")
+
+        buy_price: float = 0.0
+        if t_price is not None:
+            buy_price = abs(float(t_price))
+        elif t_amount is not None and t_qty > 0:
+            buy_price = abs(float(t_amount)) / t_qty
+
+        if t_type == "Buy" and t_qty > 0 and buy_price > 0:
+            # Weighted-average cost
+            total_cost = qty * avg_cost + t_qty * buy_price
+            qty += t_qty
+            avg_cost = total_cost / qty if qty > 0 else 0.0
+
+        elif t_type == "Sell" and t_qty > 0:
+            qty = max(0.0, qty - t_qty)
+            total_cost = qty * avg_cost  # avg_cost stays the same
+
+        # Dividend / Interest / Other do not affect qty or avg cost
+
+    conn.execute(
+        """
+        INSERT INTO portfolio_holdings
+            (symbol, quantity, avg_cost_basis, total_cost, sources, last_transaction_date)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(symbol) DO UPDATE SET
+            quantity             = excluded.quantity,
+            avg_cost_basis       = excluded.avg_cost_basis,
+            total_cost           = excluded.total_cost,
+            sources              = excluded.sources,
+            last_transaction_date = excluded.last_transaction_date,
+            last_updated         = CURRENT_TIMESTAMP
+        """,
+        (
+            symbol,
+            round(qty, 6),
+            round(avg_cost, 4),
+            round(total_cost, 2),
+            ",".join(s for s in sorted(sources) if s),
+            last_date,
+        ),
+    )
+    return is_new
+
+
+@app.post("/api/portfolio/import")
+def portfolio_import(payload: PortfolioImportIn) -> dict:
+    """
+    Accept an array of ParsedTransaction objects from the frontend service,
+    persist them to portfolio_transactions (skipping exact duplicates),
+    then recompute portfolio_holdings using the average-cost method.
+    """
+    saved = 0
+    failed = 0
+    affected: set[str] = set()
+
+    with db() as conn:
+        for txn in payload.transactions:
+            try:
+                symbol = (txn.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+
+                t_date  = txn.get("transaction_date") or ""
+                t_type  = txn.get("type") or "Other"
+                t_qty   = txn.get("quantity")
+                t_price = txn.get("price")
+
+                # Deduplicate: skip if an identical row already exists
+                existing = conn.execute(
+                    """SELECT id FROM portfolio_transactions
+                       WHERE broker = ? AND transaction_date = ? AND symbol = ?
+                         AND type = ? AND ABS(COALESCE(quantity,0) - ?) < 0.0001""",
+                    (
+                        txn.get("broker", ""),
+                        t_date,
+                        symbol,
+                        t_type,
+                        float(t_qty or 0),
+                    ),
+                ).fetchone()
+
+                if existing:
+                    continue  # already imported
+
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_transactions
+                        (broker, file_name, transaction_date, symbol, type,
+                         quantity, price, amount, raw_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        txn.get("broker", ""),
+                        txn.get("file_name", ""),
+                        t_date,
+                        symbol,
+                        t_type,
+                        float(t_qty)   if t_qty   is not None else None,
+                        float(t_price) if t_price is not None else None,
+                        float(txn["amount"]) if txn.get("amount") is not None else None,
+                        json.dumps(txn.get("raw_row") or {}),
+                    ),
+                )
+                affected.add(symbol)
+                saved += 1
+            except Exception:
+                failed += 1
+
+    # Recalculate holdings for every symbol that received new transactions
+    new_holdings: list[str] = []
+    with db() as conn:
+        for symbol in sorted(affected):
+            try:
+                if _recalculate_holding(conn, symbol):
+                    new_holdings.append(symbol)
+            except Exception:
+                pass
+
+    return {"saved": saved, "failed": failed, "new_holdings": new_holdings}
+
+
+@app.get("/api/portfolio/holdings")
+def get_portfolio_holdings() -> list[dict]:
+    """Return all current portfolio holdings with average-cost data."""
+    with db() as conn:
+        holdings = rows_to_dicts(
+            conn.execute(
+                "SELECT * FROM portfolio_holdings ORDER BY symbol"
+            ).fetchall()
+        )
+    # Enrich with current price and engine score where available
+    with db() as conn:
+        for h in holdings:
+            row = conn.execute(
+                """SELECT i.price, s.score, s.decision, s.entry_range,
+                          s.target1, s.invalidation_level
+                   FROM tickers t
+                   LEFT JOIN indicators i ON i.ticker_id = t.id
+                   LEFT JOIN scores s ON s.id = (
+                       SELECT id FROM scores WHERE ticker_id = t.id
+                       ORDER BY as_of DESC LIMIT 1)
+                   WHERE t.symbol = ?""",
+                (h["symbol"],),
+            ).fetchone()
+            if row:
+                h["current_price"]     = row["price"]
+                h["score"]             = row["score"]
+                h["decision"]          = row["decision"]
+                h["entry_range"]       = row["entry_range"]
+                h["target1"]           = row["target1"]
+                h["invalidation_level"] = row["invalidation_level"]
+                if row["price"] and h.get("avg_cost_basis"):
+                    h["unrealized_pnl_pct"] = round(
+                        (row["price"] / h["avg_cost_basis"] - 1) * 100, 2
+                    )
+    return holdings
+
+
+@app.get("/api/portfolio/transactions")
+def get_portfolio_transactions(symbol: Optional[str] = None, limit: int = 200) -> list[dict]:
+    """Return raw imported transactions, optionally filtered by symbol."""
+    with db() as conn:
+        if symbol:
+            return rows_to_dicts(
+                conn.execute(
+                    "SELECT * FROM portfolio_transactions WHERE symbol = ? ORDER BY transaction_date DESC LIMIT ?",
+                    (symbol.upper(), limit),
+                ).fetchall()
+            )
+        return rows_to_dicts(
+            conn.execute(
+                "SELECT * FROM portfolio_transactions ORDER BY transaction_date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        )
+
+
 frontend_dist = ROOT / "frontend" / "dist"
 if frontend_dist.exists():
     @app.get("/learning-insights")
