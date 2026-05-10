@@ -109,6 +109,9 @@ class SnapshotOutcomeIn(BaseModel):
 def startup() -> None:
     init_db()
     seed_defaults()
+    # Initialise default settings (INSERT OR IGNORE = safe to run every time)
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('enablePortfolioOS', 'false')")
     threading.Thread(target=safe_startup_refresh, daemon=True).start()
 
 
@@ -136,6 +139,8 @@ def dashboard() -> dict:
                        i.macd_trend AS indicator_macd_trend, i.momentum_score, i.momentum_divergence,
                        i.adx, i.adx_interpretation, i.trend_alignment, i.trend_strength_score, i.trend_strength_summary,
                        i.obv_trend, i.volume_vs_20d, i.rising_volume_on_up_days, i.volume_confirmation, i.volume_confirmation_summary,
+                       i.earnings_signal_json, i.sector_rs_signal_json, i.regime_signal_json,
+                       i.insider_signal_json, i.fundamentals_signal_json,
                        s.score, s.decision, s.confidence, s.risk, s.trend_label, s.momentum_label,
                        s.trend_strength_summary AS score_trend_strength_summary, s.momentum_summary, s.macd_trend, s.volume_label,
                        s.volume_confirmation_summary AS score_volume_confirmation_summary,
@@ -160,6 +165,7 @@ def dashboard() -> dict:
         )
         for card in cards:
             hydrate_setup_checklist(card)
+            hydrate_signal_blobs(card)
             card["similar_setup_memory"] = similar_setup_memory(card["symbol"], card.get("buy_zone_confluence") or card.get("score"))
             card["historical_accuracy_70_plus"] = high_quality_accuracy_for_ticker(card["symbol"])
             if card.get("price"):
@@ -184,6 +190,7 @@ def dashboard() -> dict:
         },
         "settings": {
             "show_beginner_price_help": settings.get("show_beginner_price_help", "true").lower() != "false",
+            "enable_portfolio_os": settings.get("enablePortfolioOS", "false").lower() == "true",
         },
         "cards": cards,
         "watchlists": watchlists,
@@ -206,6 +213,29 @@ def hydrate_setup_checklist(item: dict) -> None:
     item["setup_positive_factors"] = parse_json_list(item.get("setup_positive_factors"))
     item["setup_concern_factors"] = parse_json_list(item.get("setup_concern_factors"))
     item["decision_reasons"] = parse_json_list(item.get("decision_reasons"))
+
+
+def _parse_json_dict(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def hydrate_signal_blobs(item: dict) -> None:
+    """Unpack the 5 new signal JSON blobs into flat keys on the card/indicator dict."""
+    for key in [
+        "earnings_signal_json",
+        "sector_rs_signal_json",
+        "regime_signal_json",
+        "insider_signal_json",
+        "fundamentals_signal_json",
+    ]:
+        blob = _parse_json_dict(item.pop(key, None))
+        item.update(blob)
 
 
 def watchlist_summary(conn) -> list[dict]:
@@ -317,12 +347,15 @@ def get_news() -> dict:
 def get_settings() -> dict:
     with db() as conn:
         rows = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-    return {"show_beginner_price_help": rows.get("show_beginner_price_help", "true").lower() != "false"}
+    return {
+        "show_beginner_price_help": rows.get("show_beginner_price_help", "true").lower() != "false",
+        "enable_portfolio_os": rows.get("enablePortfolioOS", "false").lower() == "true",
+    }
 
 
 @app.patch("/api/settings/{key}")
 def update_setting(key: str, payload: SettingIn) -> dict:
-    allowed = {"show_beginner_price_help"}
+    allowed = {"show_beginner_price_help", "enablePortfolioOS"}
     if key not in allowed:
         raise HTTPException(400, "Unknown setting")
     with db() as conn:
@@ -438,10 +471,14 @@ def ticker_detail(symbol: str) -> dict:
         pivots = cached_pivots(ticker_id)
         fib_zones = cached_fib_zones(ticker_id)
         sr_zones = cached_sr_zones(ticker_id)
+    ind_dict = dict(indicators) if indicators else None
+    if ind_dict:
+        hydrate_signal_blobs(ind_dict)
+
     return {
         "ticker": dict(ticker),
         "prices": list(reversed(prices)),
-        "indicators": dict(indicators) if indicators else None,
+        "indicators": ind_dict,
         "pivots": pivots,
         "major_pivots": major_swings(pivots),
         "fib_zones": fib_zones,
@@ -657,6 +694,337 @@ async def import_positions(file: UploadFile) -> dict:
             )
             imported += 1
     return {"imported": imported}
+
+
+# ── Portfolio OS — import endpoint ────────────────────────────────────────────
+
+class PortfolioImportIn(BaseModel):
+    transactions: list[Dict[str, Any]]
+
+
+def _recalculate_holding(conn, symbol: str) -> bool:
+    """
+    Recompute portfolio_holdings for a single symbol from all its stored
+    transactions using the **average cost method**.
+
+    Returns True if this is a brand-new holding (didn't exist before this call).
+    """
+    is_new = conn.execute(
+        "SELECT 1 FROM portfolio_holdings WHERE symbol = ?", (symbol,)
+    ).fetchone() is None
+
+    txns = rows_to_dicts(
+        conn.execute(
+            "SELECT * FROM portfolio_transactions WHERE symbol = ? ORDER BY transaction_date, id",
+            (symbol,),
+        ).fetchall()
+    )
+
+    qty: float = 0.0
+    avg_cost: float = 0.0
+    total_cost: float = 0.0
+    sources: set[str] = set()
+    last_date: str | None = None
+
+    for txn in txns:
+        broker = txn.get("broker") or ""
+        if broker:
+            sources.add(broker)
+        last_date = txn.get("transaction_date") or last_date
+
+        t_type = txn.get("type") or "Other"
+        t_qty   = abs(float(txn.get("quantity") or 0))
+        t_price = txn.get("price")
+        t_amount = txn.get("amount")
+
+        buy_price: float = 0.0
+        if t_price is not None:
+            buy_price = abs(float(t_price))
+        elif t_amount is not None and t_qty > 0:
+            buy_price = abs(float(t_amount)) / t_qty
+
+        if t_type == "Buy" and t_qty > 0 and buy_price > 0:
+            # Weighted-average cost
+            total_cost = qty * avg_cost + t_qty * buy_price
+            qty += t_qty
+            avg_cost = total_cost / qty if qty > 0 else 0.0
+
+        elif t_type == "Sell" and t_qty > 0:
+            qty = max(0.0, qty - t_qty)
+            total_cost = qty * avg_cost  # avg_cost stays the same
+
+        # Dividend / Interest / Other do not affect qty or avg cost
+
+    conn.execute(
+        """
+        INSERT INTO portfolio_holdings
+            (symbol, quantity, avg_cost_basis, total_cost, sources, last_transaction_date)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(symbol) DO UPDATE SET
+            quantity             = excluded.quantity,
+            avg_cost_basis       = excluded.avg_cost_basis,
+            total_cost           = excluded.total_cost,
+            sources              = excluded.sources,
+            last_transaction_date = excluded.last_transaction_date,
+            last_updated         = CURRENT_TIMESTAMP
+        """,
+        (
+            symbol,
+            round(qty, 6),
+            round(avg_cost, 4),
+            round(total_cost, 2),
+            ",".join(s for s in sorted(sources) if s),
+            last_date,
+        ),
+    )
+    return is_new
+
+
+@app.post("/api/portfolio/import")
+def portfolio_import(payload: PortfolioImportIn) -> dict:
+    """
+    Accept an array of ParsedTransaction objects from the frontend service,
+    persist them to portfolio_transactions (skipping exact duplicates),
+    then recompute portfolio_holdings using the average-cost method.
+    """
+    saved = 0
+    failed = 0
+    affected: set[str] = set()
+
+    with db() as conn:
+        for txn in payload.transactions:
+            try:
+                symbol = (txn.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+
+                t_date  = txn.get("transaction_date") or ""
+                t_type  = txn.get("type") or "Other"
+                t_qty   = txn.get("quantity")
+                t_price = txn.get("price")
+
+                # Deduplicate: skip if an identical row already exists
+                existing = conn.execute(
+                    """SELECT id FROM portfolio_transactions
+                       WHERE broker = ? AND transaction_date = ? AND symbol = ?
+                         AND type = ? AND ABS(COALESCE(quantity,0) - ?) < 0.0001""",
+                    (
+                        txn.get("broker", ""),
+                        t_date,
+                        symbol,
+                        t_type,
+                        float(t_qty or 0),
+                    ),
+                ).fetchone()
+
+                if existing:
+                    continue  # already imported
+
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_transactions
+                        (broker, file_name, transaction_date, symbol, type,
+                         quantity, price, amount, raw_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        txn.get("broker", ""),
+                        txn.get("file_name", ""),
+                        t_date,
+                        symbol,
+                        t_type,
+                        float(t_qty)   if t_qty   is not None else None,
+                        float(t_price) if t_price is not None else None,
+                        float(txn["amount"]) if txn.get("amount") is not None else None,
+                        json.dumps(txn.get("raw_row") or {}),
+                    ),
+                )
+                affected.add(symbol)
+                saved += 1
+            except Exception:
+                failed += 1
+
+    # Recalculate holdings for every symbol that received new transactions
+    new_holdings: list[str] = []
+    with db() as conn:
+        for symbol in sorted(affected):
+            try:
+                if _recalculate_holding(conn, symbol):
+                    new_holdings.append(symbol)
+            except Exception:
+                pass
+
+    return {"saved": saved, "failed": failed, "new_holdings": new_holdings}
+
+
+@app.get("/api/portfolio/holdings")
+def get_portfolio_holdings() -> list[dict]:
+    """Return all current portfolio holdings with average-cost data."""
+    with db() as conn:
+        holdings = rows_to_dicts(
+            conn.execute(
+                "SELECT * FROM portfolio_holdings ORDER BY symbol"
+            ).fetchall()
+        )
+    # Enrich with current price and engine score where available
+    with db() as conn:
+        for h in holdings:
+            row = conn.execute(
+                """SELECT i.price, s.score, s.decision, s.entry_range,
+                          s.target1, s.invalidation_level
+                   FROM tickers t
+                   LEFT JOIN indicators i ON i.ticker_id = t.id
+                   LEFT JOIN scores s ON s.id = (
+                       SELECT id FROM scores WHERE ticker_id = t.id
+                       ORDER BY as_of DESC LIMIT 1)
+                   WHERE t.symbol = ?""",
+                (h["symbol"],),
+            ).fetchone()
+            if row:
+                h["current_price"]     = row["price"]
+                h["score"]             = row["score"]
+                h["decision"]          = row["decision"]
+                h["entry_range"]       = row["entry_range"]
+                h["target1"]           = row["target1"]
+                h["invalidation_level"] = row["invalidation_level"]
+                if row["price"] and h.get("avg_cost_basis"):
+                    h["unrealized_pnl_pct"] = round(
+                        (row["price"] / h["avg_cost_basis"] - 1) * 100, 2
+                    )
+    return holdings
+
+
+@app.get("/api/portfolio/transactions")
+def get_portfolio_transactions(
+    symbol: Optional[str] = None,
+    type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Return raw imported transactions with optional symbol / type / date filters."""
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if symbol:
+        clauses.append("symbol = ?")
+        params.append(symbol.upper())
+    if type:
+        clauses.append("type = ?")
+        params.append(type)
+    if date_from:
+        clauses.append("transaction_date >= ?")
+        params.append(date_from)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+
+    with db() as conn:
+        return rows_to_dicts(
+            conn.execute(
+                f"SELECT * FROM portfolio_transactions {where} ORDER BY transaction_date DESC LIMIT ?",
+                params,
+            ).fetchall()
+        )
+
+
+@app.post("/api/portfolio/recalculate")
+def portfolio_recalculate() -> dict:
+    """
+    Rebuild portfolio_holdings from scratch for every symbol that has
+    at least one transaction row.  Useful after manual edits or bulk imports.
+    """
+    with db() as conn:
+        symbols = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT symbol FROM portfolio_transactions WHERE symbol IS NOT NULL"
+            ).fetchall()
+        ]
+        refreshed = 0
+        for sym in symbols:
+            _recalculate_holding(conn, sym)
+            refreshed += 1
+    return {"refreshed": refreshed, "symbols": symbols}
+
+
+@app.get("/api/portfolio/summary")
+def get_portfolio_summary() -> dict:
+    """
+    Aggregate portfolio_holdings into a single summary object.
+
+    Fields returned:
+      totalValue          – sum of (quantity × current_price) for priced holdings
+      totalCost           – sum of total_cost across all holdings
+      unrealizedPL        – totalValue − totalCost
+      unrealizedPLPercent – (unrealizedPL / totalCost) × 100
+      cashBalance         – total_cost for the synthetic CASH symbol (if present)
+      topHoldings         – up to 10 holdings sorted by current market value desc
+    """
+    with db() as conn:
+        holdings = rows_to_dicts(
+            conn.execute("SELECT * FROM portfolio_holdings ORDER BY symbol").fetchall()
+        )
+        # Enrich with current price from engine
+        for h in holdings:
+            row = conn.execute(
+                """SELECT i.price, s.score, s.decision
+                   FROM tickers t
+                   LEFT JOIN indicators i ON i.ticker_id = t.id
+                   LEFT JOIN scores s ON s.id = (
+                       SELECT id FROM scores WHERE ticker_id = t.id
+                       ORDER BY as_of DESC LIMIT 1)
+                   WHERE t.symbol = ?""",
+                (h["symbol"],),
+            ).fetchone()
+            if row:
+                h["current_price"] = row["price"]
+                h["score"]         = row["score"]
+                h["decision"]      = row["decision"]
+                if row["price"] and h.get("avg_cost_basis"):
+                    h["unrealized_pnl_pct"] = round(
+                        (row["price"] / h["avg_cost_basis"] - 1) * 100, 2
+                    )
+
+    total_cost:  float = 0.0
+    total_value: float = 0.0
+    cash_balance: float = 0.0
+
+    for h in holdings:
+        cost = float(h.get("total_cost") or 0)
+        qty  = float(h.get("quantity")   or 0)
+        price = h.get("current_price")
+
+        if h["symbol"] == "CASH":
+            cash_balance += cost
+            continue
+
+        total_cost += cost
+        if price and qty:
+            total_value += qty * float(price)
+        else:
+            # Fall back to cost basis when no live price
+            total_value += cost
+
+    unrealized_pl = total_value - total_cost
+    unrealized_pct = round((unrealized_pl / total_cost * 100), 2) if total_cost else 0.0
+
+    # Top holdings by market value (descending)
+    priced = [h for h in holdings if h["symbol"] != "CASH"]
+    priced.sort(
+        key=lambda h: (
+            float(h.get("quantity") or 0) * float(h.get("current_price") or h.get("avg_cost_basis") or 0)
+        ),
+        reverse=True,
+    )
+
+    return {
+        "totalValue":           round(total_value, 2),
+        "totalCost":            round(total_cost, 2),
+        "unrealizedPL":         round(unrealized_pl, 2),
+        "unrealizedPLPercent":  unrealized_pct,
+        "cashBalance":          round(cash_balance, 2),
+        "topHoldings":          priced[:10],
+    }
 
 
 frontend_dist = ROOT / "frontend" / "dist"
