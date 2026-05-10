@@ -109,6 +109,9 @@ class SnapshotOutcomeIn(BaseModel):
 def startup() -> None:
     init_db()
     seed_defaults()
+    # Initialise default settings (INSERT OR IGNORE = safe to run every time)
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('enablePortfolioOS', 'false')")
     threading.Thread(target=safe_startup_refresh, daemon=True).start()
 
 
@@ -187,6 +190,7 @@ def dashboard() -> dict:
         },
         "settings": {
             "show_beginner_price_help": settings.get("show_beginner_price_help", "true").lower() != "false",
+            "enable_portfolio_os": settings.get("enablePortfolioOS", "false").lower() == "true",
         },
         "cards": cards,
         "watchlists": watchlists,
@@ -343,12 +347,15 @@ def get_news() -> dict:
 def get_settings() -> dict:
     with db() as conn:
         rows = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-    return {"show_beginner_price_help": rows.get("show_beginner_price_help", "true").lower() != "false"}
+    return {
+        "show_beginner_price_help": rows.get("show_beginner_price_help", "true").lower() != "false",
+        "enable_portfolio_os": rows.get("enablePortfolioOS", "false").lower() == "true",
+    }
 
 
 @app.patch("/api/settings/{key}")
 def update_setting(key: str, payload: SettingIn) -> dict:
-    allowed = {"show_beginner_price_help"}
+    allowed = {"show_beginner_price_help", "enablePortfolioOS"}
     if key not in allowed:
         raise HTTPException(400, "Unknown setting")
     with db() as conn:
