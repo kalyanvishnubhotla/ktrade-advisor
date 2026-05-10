@@ -35,6 +35,7 @@ from .recommendation_snapshots import (
 )
 from .zones import cached_sr_zones, nearest_zones
 from .research import parse_research_signal
+from .pdf_statement_parser import parse_etrade_pdf
 
 app = FastAPI(title="Ktrade Advisor")
 app.add_middleware(
@@ -877,6 +878,29 @@ def portfolio_import(payload: PortfolioImportIn) -> dict:
         "div_symbols": div_symbols,
         "has_buys": type_counts.get("Buy", 0) > 0,
     }
+
+
+@app.post("/api/portfolio/parse-pdf")
+async def parse_pdf_statement(file: UploadFile) -> dict:
+    """
+    Accept an E*TRADE monthly PDF statement, parse it with pdfplumber, and
+    return the extracted transactions + holdings for client-side preview.
+
+    The client can then POST the transactions to /api/portfolio/import as usual.
+    """
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
+    try:
+        result = parse_etrade_pdf(pdf_bytes, file.filename)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"PDF parsing failed: {exc}")
+
+    return result
 
 
 @app.get("/api/portfolio/holdings")

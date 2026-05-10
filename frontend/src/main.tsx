@@ -61,8 +61,8 @@ import {
 import { useAutoRefresh } from './hooks/useAutoRefresh';
 import { getAllHoldings, getPortfolioSummary, getTransactions, refreshPortfolioSignals } from './services/portfolioService';
 import type { PortfolioHolding, PortfolioSummary, PortfolioTransaction, TransactionFilters } from './services/portfolioService';
-import { importPortfolioFiles, parseEtradeCSV, parseRobinhoodCSV } from './services/portfolioImportService';
-import type { ParsedTransaction, ImportResult } from './services/portfolioImportService';
+import { importPortfolioFiles, parsePDFStatement, parseEtradeCSV, parseRobinhoodCSV } from './services/portfolioImportService';
+import type { ParsedTransaction, ImportResult, PDFParseResult } from './services/portfolioImportService';
 
 // ── HelpIcon ──────────────────────────────────────────────────────────────────
 function HelpIcon({ text }: { text: string }) {
@@ -1852,8 +1852,21 @@ function PortfolioTransactions() {
 
 // ── Multi-file import panel ───────────────────────────────────────────────────
 interface FilePreview {
-  file: File; broker: string; count: number;
-  symbols: string[]; dateRange: string; parsed: ParsedTransaction[];
+  file: File;
+  broker: string;
+  count: number;
+  symbols: string[];
+  dateRange: string;
+  parsed: ParsedTransaction[];
+  // PDF-specific extras
+  isPDF?: boolean;
+  statementPeriod?: string;
+  accountNumber?: string;
+  totalValue?: number | null;
+  currentHoldings?: PDFParseResult['holdings'];
+  pdfWarnings?: string[];
+  parsing?: boolean;   // true while backend is processing
+  parseError?: string;
 }
 
 function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result: ImportResult) => void }) {
@@ -1868,20 +1881,58 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
   const processFiles = async (files: File[]) => {
     setResult(null); setError('');
     const ps: FilePreview[] = [];
+
     for (const f of files) {
-      const text = await f.text();
-      const et = parseEtradeCSV(text, f.name);
-      const rh = parseRobinhoodCSV(text, f.name);
-      const parsed = et.length >= rh.length ? et : rh;
-      const broker = et.length >= rh.length ? 'E*TRADE' : 'Robinhood';
-      // Fallback: if neither parser got results, flag as unknown
-      const finalBroker = parsed.length ? broker : 'Unknown — check format';
-      const syms = [...new Set(parsed.map(t => t.symbol))].filter(Boolean).sort();
-      const dates = parsed.map(t => t.transaction_date).filter(Boolean).sort();
-      const dateRange = dates.length ? `${dates[0]} → ${dates[dates.length - 1]}` : '—';
-      ps.push({ file: f, broker: finalBroker, count: parsed.length, symbols: syms, dateRange, parsed });
+      const isPDF = f.name.toLowerCase().endsWith('.pdf');
+
+      if (isPDF) {
+        // Show a "parsing…" placeholder immediately, then fill in the result
+        const placeholder: FilePreview = {
+          file: f, broker: 'E*TRADE', count: 0, symbols: [], dateRange: '—',
+          parsed: [], isPDF: true, parsing: true,
+        };
+        ps.push(placeholder);
+        setPreviews([...ps]);  // show loading state right away
+
+        try {
+          const pdfResult = await parsePDFStatement(f);
+          const txns = pdfResult.transactions;
+          const syms = [...new Set(txns.map(t => t.symbol))].filter(s => s !== 'CASH').sort();
+          const dates = txns.map(t => t.transaction_date).filter(Boolean).sort();
+          Object.assign(placeholder, {
+            count: txns.length,
+            symbols: syms,
+            dateRange: dates.length ? `${dates[0]} → ${dates[dates.length - 1]}` : '—',
+            parsed: txns,
+            parsing: false,
+            statementPeriod: pdfResult.metadata.statement_period,
+            accountNumber: pdfResult.metadata.account_number,
+            totalValue: pdfResult.metadata.total_value,
+            currentHoldings: pdfResult.holdings,
+            pdfWarnings: pdfResult.warnings,
+          });
+        } catch (e) {
+          Object.assign(placeholder, {
+            parsing: false,
+            parseError: e instanceof Error ? e.message : 'PDF parse failed',
+          });
+        }
+        setPreviews([...ps]);
+      } else {
+        // CSV: client-side parsing
+        const text = await f.text();
+        const et = parseEtradeCSV(text, f.name);
+        const rh = parseRobinhoodCSV(text, f.name);
+        const parsed = et.length >= rh.length ? et : rh;
+        const broker = et.length >= rh.length ? 'E*TRADE' : 'Robinhood';
+        const finalBroker = parsed.length ? broker : 'Unknown — check format';
+        const syms = [...new Set(parsed.map(t => t.symbol))].filter(Boolean).sort();
+        const dates = parsed.map(t => t.transaction_date).filter(Boolean).sort();
+        const dateRange = dates.length ? `${dates[0]} → ${dates[dates.length - 1]}` : '—';
+        ps.push({ file: f, broker: finalBroker, count: parsed.length, symbols: syms, dateRange, parsed });
+        setPreviews([...ps]);
+      }
     }
-    setPreviews(ps);
   };
 
   const doImport = async () => {
@@ -1889,7 +1940,7 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
     try {
       const res = await importPortfolioFiles(previews.map(p => p.file));
       setResult(res);
-      onImportComplete(res);   // bubble result up so PortfolioOS can show toast
+      onImportComplete(res);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Import failed');
     } finally { setImporting(false); }
@@ -1907,7 +1958,7 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
           <div>
             <h3>Supported Brokers</h3>
             <div className="broker-chips" style={{ marginTop: 'var(--space-2)' }}>
-              {['Robinhood CSV', 'E*TRADE CSV'].map(b => <span key={b} className="broker-chip">{b}</span>)}
+              {['Robinhood CSV', 'E*TRADE PDF', 'E*TRADE CSV'].map(b => <span key={b} className="broker-chip">{b}</span>)}
             </div>
           </div>
           <button
@@ -1923,11 +1974,21 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
             {[
               {
                 broker: 'Robinhood',
-                steps: ['Open the Robinhood app or website', 'Tap Account → Statements & History', 'Find Account Activity → tap Download', 'Save the CSV, then drop it below'],
+                steps: [
+                  'Go to robinhood.com → Account (top right)',
+                  'Click History → Brokerage → set "All time"',
+                  'Click Download CSV (buys, sells, dividends)',
+                  'Repeat for each account, then drop below',
+                ],
               },
               {
-                broker: 'E*TRADE',
-                steps: ['Log in at etrade.com', 'Go to Accounts → Documents', 'Choose Brokerage Download', 'Export as CSV, then drop it below'],
+                broker: 'E*TRADE (PDF)',
+                steps: [
+                  'Log in at etrade.com',
+                  'Go to Accounts → Documents → Statements',
+                  'Open any monthly statement PDF',
+                  'Download and drop the PDF directly below',
+                ],
               },
             ].map(({ broker, steps }) => (
               <div key={broker} style={{ background: 'var(--bg-surface-3)', borderRadius: 10, padding: 'var(--space-4)' }}>
@@ -1941,7 +2002,7 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
         )}
 
         <p style={{ marginTop: 'var(--space-3)', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
-          Nothing leaves your Mac — files are parsed in the browser; only the parsed transactions are sent to the local backend.
+          PDFs are parsed on your local backend — nothing leaves your Mac.
         </p>
       </div>
 
@@ -1953,15 +2014,17 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
           onDragLeave={() => setDragOver(false)}
           onDrop={(e) => {
             e.preventDefault(); setDragOver(false);
-            const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith('.csv'));
+            const files = Array.from(e.dataTransfer.files).filter(f =>
+              f.name.endsWith('.csv') || f.name.toLowerCase().endsWith('.pdf')
+            );
             if (files.length) processFiles(files);
           }}
           onClick={() => fileRef.current?.click()}
         >
           <Upload size={40} style={{ color: dragOver ? 'var(--green-text)' : 'var(--text-tertiary)' }} />
-          <div className="upload-title">Drop one or more CSV files here</div>
-          <div className="upload-sub">Supports multiple files · or click to browse</div>
-          <input ref={fileRef} type="file" accept=".csv" multiple style={{ display: 'none' }}
+          <div className="upload-title">Drop CSV or PDF files here</div>
+          <div className="upload-sub">Robinhood CSV · E*TRADE PDF or CSV · multiple files OK</div>
+          <input ref={fileRef} type="file" accept=".csv,.pdf" multiple style={{ display: 'none' }}
             onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) processFiles(files); e.target.value = ''; }} />
         </div>
       )}
@@ -1980,11 +2043,23 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
                 {previews.map((p, i) => (
                   <tr key={i}>
                     <td style={{ fontSize: 'var(--text-xs)', fontFamily: 'var(--font-mono)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.file.name}</td>
-                    <td><span className="broker-chip">{p.broker}</span></td>
-                    <td style={{ fontFamily: 'var(--font-mono)' }}>{p.count}</td>
+                    <td>
+                      <span className="broker-chip">{p.broker}</span>
+                      {p.isPDF && p.statementPeriod && (
+                        <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginLeft: 6 }}>{p.statementPeriod}</span>
+                      )}
+                    </td>
+                    <td style={{ fontFamily: 'var(--font-mono)' }}>
+                      {p.parsing ? <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-xs)' }}>Parsing…</span> : p.count}
+                    </td>
                     <td style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>{p.dateRange}</td>
                     <td style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {p.symbols.slice(0, 8).join(', ')}{p.symbols.length > 8 ? ` +${p.symbols.length - 8} more` : ''}
+                      {p.parseError
+                        ? <span style={{ color: 'var(--red-text)' }}>⚠ {p.parseError}</span>
+                        : p.symbols.length > 0
+                          ? `${p.symbols.slice(0, 8).join(', ')}${p.symbols.length > 8 ? ` +${p.symbols.length - 8} more` : ''}`
+                          : '—'
+                      }
                     </td>
                   </tr>
                 ))}
@@ -1992,10 +2067,52 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
             </table>
           </div>
 
+          {/* PDF-specific: current holdings snapshot */}
+          {previews.some(p => p.isPDF && (p.currentHoldings?.length ?? 0) > 0) && (
+            <div className="panel" style={{ background: 'var(--bg-surface-2)' }}>
+              <div style={{ fontWeight: 600, fontSize: 'var(--text-sm)', marginBottom: 'var(--space-3)' }}>
+                📋 Current holdings in this statement
+              </div>
+              <div className="table-panel">
+                <table>
+                  <thead><tr><th>Symbol</th><th>Company</th><th>Qty</th><th>Price</th><th>Cost Basis</th><th>Mkt Value</th><th>Unrealized G/L</th></tr></thead>
+                  <tbody>
+                    {previews.flatMap(p => p.currentHoldings ?? []).map((h, i) => (
+                      <tr key={i}>
+                        <td><b>{h.symbol}</b></td>
+                        <td style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>{h.company}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>{h.quantity.toLocaleString()}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>{h.share_price ? formatMoney(h.share_price) : '—'}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>{h.total_cost ? formatMoney(h.total_cost) : '—'}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>{h.market_value ? formatMoney(h.market_value) : '—'}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)', color: (h.unrealized_gl ?? 0) >= 0 ? 'var(--green-text)' : 'var(--red-text)', fontWeight: 600 }}>
+                          {h.unrealized_gl != null ? `${h.unrealized_gl >= 0 ? '+' : ''}${formatMoney(h.unrealized_gl)}` : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* PDF parse warnings */}
+          {previews.some(p => (p.pdfWarnings?.length ?? 0) > 0) && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+              {previews.flatMap(p => p.pdfWarnings ?? []).map((w, i) => (
+                <div key={i} className="alert" style={{ background: 'var(--gold-muted)', borderColor: 'var(--gold-dim)', color: 'var(--gold-text)' }}>
+                  <AlertTriangle size={14} style={{ flexShrink: 0 }} />{w}
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Sample rows from first file */}
           {previews[0]?.parsed.length > 0 && (
             <>
-              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', fontWeight: 600 }}>Sample — first 10 transactions</div>
+              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                Sample — first 10 transactions
+              </div>
               <div className="table-panel">
                 <table>
                   <thead><tr><th>Date</th><th>Symbol</th><th>Type</th><th>Qty</th><th>Price</th><th>Broker</th></tr></thead>

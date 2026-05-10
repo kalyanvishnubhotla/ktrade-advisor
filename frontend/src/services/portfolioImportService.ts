@@ -340,12 +340,50 @@ function detectBroker(csvText: string, fileName: string): 'etrade' | 'robinhood'
 
 const API_BASE = '';
 
+export interface PDFParseResult {
+  transactions: ParsedTransaction[];
+  holdings: Array<{
+    symbol: string;
+    company: string;
+    quantity: number;
+    share_price: number | null;
+    total_cost: number | null;
+    market_value: number | null;
+    unrealized_gl: number | null;
+  }>;
+  metadata: {
+    statement_period: string;
+    account_number: string;
+    total_value: number | null;
+    broker: string;
+  };
+  warnings: string[];
+}
+
 /**
- * Parse one or more broker CSV files, POST the transactions to the backend,
- * and return a summary of what was imported and which holdings are new.
+ * Send a PDF file to the backend for parsing.
+ * Returns structured transactions + holdings + statement metadata.
+ */
+export async function parsePDFStatement(file: File): Promise<PDFParseResult> {
+  const form = new FormData();
+  form.append('file', file);
+  const resp = await fetch(`${API_BASE}/api/portfolio/parse-pdf`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => resp.statusText);
+    throw new Error(`PDF parse failed: ${body}`);
+  }
+  return resp.json();
+}
+
+/**
+ * Parse one or more broker files (CSV or PDF), POST the transactions to the
+ * backend, and return a summary of what was imported and which holdings are new.
  *
- * Average-cost-basis calculation happens on the backend so it stays consistent
- * even across multiple import sessions.
+ * PDF files (E*TRADE statements) are sent to the backend for pdfplumber parsing.
+ * CSV files are parsed client-side and then imported.
  */
 export async function importPortfolioFiles(
   files: FileList | File[],
@@ -356,27 +394,39 @@ export async function importPortfolioFiles(
 
   for (const file of fileArray) {
     try {
-      const text  = await file.text();
-      const broker = detectBroker(text, file.name);
+      const isPDF = file.name.toLowerCase().endsWith('.pdf');
 
-      let parsed: ParsedTransaction[];
-      if (broker === 'etrade') {
-        parsed = parseEtradeCSV(text, file.name);
-      } else if (broker === 'robinhood') {
-        parsed = parseRobinhoodCSV(text, file.name);
+      if (isPDF) {
+        // ── PDF path: backend parses it ──────────────────────────────────────
+        const result = await parsePDFStatement(file);
+        if (result.transactions.length === 0) {
+          failedFiles++;
+          continue;
+        }
+        allTransactions.push(...result.transactions.map(t => ({ ...t, file_name: file.name })));
       } else {
-        // Unknown broker: try both parsers, keep the result with more rows
-        const et = parseEtradeCSV(text, file.name);
-        const rh = parseRobinhoodCSV(text, file.name);
-        parsed = et.length >= rh.length ? et : rh;
-      }
+        // ── CSV path: client-side parsing ─────────────────────────────────────
+        const text   = await file.text();
+        const broker = detectBroker(text, file.name);
 
-      if (parsed.length === 0) {
-        failedFiles++;
-        continue;
-      }
+        let parsed: ParsedTransaction[];
+        if (broker === 'etrade') {
+          parsed = parseEtradeCSV(text, file.name);
+        } else if (broker === 'robinhood') {
+          parsed = parseRobinhoodCSV(text, file.name);
+        } else {
+          const et = parseEtradeCSV(text, file.name);
+          const rh = parseRobinhoodCSV(text, file.name);
+          parsed = et.length >= rh.length ? et : rh;
+        }
 
-      allTransactions.push(...parsed.map(t => ({ ...t, file_name: file.name })));
+        if (parsed.length === 0) {
+          failedFiles++;
+          continue;
+        }
+
+        allTransactions.push(...parsed.map(t => ({ ...t, file_name: file.name })));
+      }
     } catch {
       failedFiles++;
     }
