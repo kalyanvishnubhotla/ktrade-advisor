@@ -4,6 +4,7 @@ import { ColorType, createChart, LineSeries, LineStyle } from 'lightweight-chart
 import { PieChart, Pie, Cell, Tooltip as RCTooltip, ResponsiveContainer, Legend } from 'recharts';
 import {
   Activity,
+  AlertTriangle,
   BookOpen,
   Briefcase,
   CheckCircle2,
@@ -2035,7 +2036,41 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
       )}
 
       {/* Success result — stays visible so user can confirm, then import more */}
-      {result && (
+      {result && !result.hasBuys && (
+        // No purchase transactions — show actionable warning
+        <div className="panel" style={{ borderColor: 'var(--gold-dim)', background: 'var(--gold-muted)' }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+            <AlertTriangle size={20} style={{ color: 'var(--gold-text)', flexShrink: 0, marginTop: 2 }} />
+            <div>
+              <div style={{ fontWeight: 700, color: 'var(--gold-text)', marginBottom: 4 }}>No purchase transactions found</div>
+              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                We saved <b>{result.success}</b> record{result.success !== 1 ? 's' : ''} (dividends/interest), but found no buy or sell transactions.
+                Without purchases, we can't calculate your cost basis or P&L.
+              </div>
+              {result.divSymbols.length > 0 && (
+                <div style={{ fontSize: 'var(--text-xs)', marginTop: 8 }}>
+                  <span style={{ color: 'var(--text-tertiary)' }}>Positions detected from dividends: </span>
+                  <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                    {result.divSymbols.join(', ')}
+                  </span>
+                </div>
+              )}
+              <div style={{ marginTop: 'var(--space-4)', background: 'var(--bg-surface-2)', border: '1px solid var(--border-subtle)', borderRadius: 10, padding: 'var(--space-3)' }}>
+                <div style={{ fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: 6 }}>How to get your full trade history from Robinhood:</div>
+                <ol style={{ margin: 0, paddingLeft: 16, fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', lineHeight: 2 }}>
+                  <li>Open <b>robinhood.com</b> → Account (top right)</li>
+                  <li>Go to <b>History</b> → <b>Brokerage</b></li>
+                  <li>Set date range to <b>"All time"</b></li>
+                  <li>Click <b>Download CSV</b> — this includes your buy &amp; sell orders</li>
+                  <li>Upload that file here</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: 'var(--space-3)' }} onClick={clear}>Upload trade history</button>
+        </div>
+      )}
+      {result && result.hasBuys && (
         <div className="panel" style={{ borderColor: 'var(--green-dim)', background: 'var(--green-muted)' }}>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
             <CheckCircle2 size={20} style={{ color: 'var(--green-text)', flexShrink: 0, marginTop: 2 }} />
@@ -2043,11 +2078,11 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result:
               <div style={{ fontWeight: 700, color: 'var(--green-text)', marginBottom: 4 }}>Import complete</div>
               <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
                 {result.success} transaction{result.success !== 1 ? 's' : ''} saved
-                {result.failed > 0 && ` · ${result.failed} skipped (duplicates)`}
+                {result.skipped > 0 && ` · ${result.skipped} duplicate${result.skipped !== 1 ? 's' : ''} skipped`}
               </div>
               {result.newHoldings.length > 0 && (
                 <div style={{ fontSize: 'var(--text-xs)', color: 'var(--green-text)', marginTop: 6, fontWeight: 600 }}>
-                  {result.newHoldings.length} new position{result.newHoldings.length !== 1 ? 's' : ''} added: {result.newHoldings.join(', ')}
+                  {result.newHoldings.length} new position{result.newHoldings.length !== 1 ? 's' : ''} added: {result.newHoldings.slice(0, 8).join(', ')}{result.newHoldings.length > 8 ? ` + ${result.newHoldings.length - 8} more` : ''}
                 </div>
               )}
               <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 8 }}>
@@ -2114,11 +2149,23 @@ function PortfolioEmptyState({ onGoToImport }: { onGoToImport: () => void }) {
             {[
               {
                 broker: 'Robinhood',
-                steps: ['Open the app or robinhood.com', 'Go to Account → Statements & History', 'Select "Download" next to Account Activity', 'Save the .csv file and drag it here'],
+                steps: [
+                  'Go to robinhood.com → Account (top right)',
+                  'Click History → Brokerage',
+                  'Set date range to "All time"',
+                  'Click Download CSV (includes buys, sells, dividends)',
+                  'Repeat for each account (individual + joint)',
+                ],
               },
               {
                 broker: 'E*TRADE',
-                steps: ['Log in at etrade.com', 'Go to Accounts → Documents', 'Choose "Brokerage Download" or "Transaction History"', 'Export as CSV and drag it here'],
+                steps: [
+                  'Log in at etrade.com',
+                  'Go to Accounts → Documents',
+                  'Choose "Brokerage Download" or "Transaction History"',
+                  'Set "All" for transaction types and full date range',
+                  'Export as CSV and drag it here',
+                ],
               },
             ].map(({ broker, steps }) => (
               <div key={broker} style={{ background: 'var(--bg-surface-2)', border: '1px solid var(--border-subtle)', borderRadius: 10, padding: 'var(--space-4)' }}>
@@ -2459,13 +2506,29 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
 
   const handleImportComplete = async (result: ImportResult) => {
     await reload();
-    // Navigate to holdings after a fresh import; overview when first time
-    setTab(result.newHoldings.length > 0 && holdings.length === 0 ? 'overview' : 'holdings');
-    let msg = `${result.success} transaction${result.success !== 1 ? 's' : ''} saved`;
-    if (result.newHoldings.length > 0) {
-      msg += ` · ${result.newHoldings.length} new position${result.newHoldings.length !== 1 ? 's' : ''}: ${result.newHoldings.join(', ')}`;
+
+    if (!result.hasBuys) {
+      // Dividends/interest imported but no purchase transactions found
+      // Stay on import tab so the user sees the "no buys" warning
+      setTab('import');
+      const divCount = result.typeCounts['Dividend'] ?? 0;
+      const intCount = result.typeCounts['Interest'] ?? 0;
+      const divInfo  = [divCount && `${divCount} dividend`, intCount && `${intCount} interest`].filter(Boolean).join(', ');
+      showToast(
+        `Saved ${result.success} records (${divInfo || 'income only'}) — no purchase transactions found. ` +
+        `Upload your full trade history to see positions and P&L.`,
+        false,
+      );
+    } else {
+      // Has buy transactions — navigate to appropriate tab
+      setTab(result.newHoldings.length > 0 && holdings.length === 0 ? 'overview' : 'holdings');
+      let msg = `${result.success} transaction${result.success !== 1 ? 's' : ''} saved`;
+      if (result.skipped > 0) msg += ` · ${result.skipped} duplicate${result.skipped !== 1 ? 's' : ''} skipped`;
+      if (result.newHoldings.length > 0) {
+        msg += ` · ${result.newHoldings.length} new position${result.newHoldings.length !== 1 ? 's' : ''}: ${result.newHoldings.slice(0, 5).join(', ')}${result.newHoldings.length > 5 ? '…' : ''}`;
+      }
+      showToast(msg, true);
     }
-    showToast(msg, true);
   };
 
   useEffect(() => { reload(); }, []);

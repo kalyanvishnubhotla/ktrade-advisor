@@ -738,9 +738,10 @@ def _recalculate_holding(conn, symbol: str) -> bool:
         t_amount = txn.get("amount")
 
         buy_price: float = 0.0
-        if t_price is not None:
+        if t_price is not None and float(t_price) > 0:
             buy_price = abs(float(t_price))
         elif t_amount is not None and t_qty > 0:
+            # price was null or 0 — derive from total amount (e.g. Robinhood fractional buys)
             buy_price = abs(float(t_amount)) / t_qty
 
         if t_type == "Buy" and t_qty > 0 and buy_price > 0:
@@ -789,7 +790,9 @@ def portfolio_import(payload: PortfolioImportIn) -> dict:
     """
     saved = 0
     failed = 0
+    skipped = 0
     affected: set[str] = set()
+    type_counts: dict[str, int] = {}
 
     with db() as conn:
         for txn in payload.transactions:
@@ -818,6 +821,7 @@ def portfolio_import(payload: PortfolioImportIn) -> dict:
                 ).fetchone()
 
                 if existing:
+                    skipped += 1
                     continue  # already imported
 
                 conn.execute(
@@ -840,6 +844,7 @@ def portfolio_import(payload: PortfolioImportIn) -> dict:
                     ),
                 )
                 affected.add(symbol)
+                type_counts[t_type] = type_counts.get(t_type, 0) + 1
                 saved += 1
             except Exception:
                 failed += 1
@@ -854,7 +859,24 @@ def portfolio_import(payload: PortfolioImportIn) -> dict:
             except Exception:
                 pass
 
-    return {"saved": saved, "failed": failed, "new_holdings": new_holdings}
+    # Symbols seen in dividends/interest (user may own these even without buy records)
+    div_symbols: list[str] = []
+    if type_counts.get("Dividend", 0) > 0 or type_counts.get("Interest", 0) > 0:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT symbol FROM portfolio_transactions WHERE type IN ('Dividend','Interest') AND symbol != 'CASH'"
+            ).fetchall()
+            div_symbols = [r[0] for r in rows]
+
+    return {
+        "saved": saved,
+        "failed": failed,
+        "skipped": skipped,
+        "new_holdings": new_holdings,
+        "type_counts": type_counts,
+        "div_symbols": div_symbols,
+        "has_buys": type_counts.get("Buy", 0) > 0,
+    }
 
 
 @app.get("/api/portfolio/holdings")
