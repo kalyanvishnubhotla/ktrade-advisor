@@ -8,9 +8,11 @@ import pandas as pd
 from .analysis import compute_indicators, market_condition
 from .database import db, rows_to_dicts, upsert_ticker
 from .fibonacci import cache_fib_zones
+from .market_regime import analyze_market_regime
 from .news import refresh_news
 from .pivots import cache_pivots
 from .recommendation_snapshots import save_snapshot
+from .sector_relative_strength import get_sector_etf
 from .technical_zone_analyzer import TechnicalZoneAnalyzer
 from .zones import cache_sr_zones
 
@@ -28,9 +30,18 @@ def refresh_all() -> dict:
 
     spy_history, _ = fetch_history("SPY")
     qqq_history, _ = fetch_history("QQQ")
+    iwm_history, _ = fetch_history("IWM")
     spy_ind = compute_indicators(spy_history)
     qqq_ind = compute_indicators(qqq_history)
+    iwm_ind = compute_indicators(iwm_history)
     market = market_condition(spy_ind, qqq_ind)
+
+    # Compute market regime once for all tickers (VIX fetch happens inside)
+    regime_data = analyze_market_regime(spy_ind=spy_ind, qqq_ind=qqq_ind, iwm_ind=iwm_ind)
+
+    # Pre-fetch sector ETF histories to share across tickers in same sector
+    sector_etf_cache: dict[str, pd.DataFrame] = {}
+
     analyzer = TechnicalZoneAnalyzer(period="2y")
 
     for ticker in tickers:
@@ -40,7 +51,29 @@ def refresh_all() -> dict:
                 signals = rows_to_dicts(
                     conn.execute("SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at", (ticker["id"],)).fetchall()
                 )
-            analysis = analyzer.analyze(symbol, spy_history=spy_history, research_signals=signals)
+            # Fetch sector ETF history (cached per ETF symbol across tickers)
+            sector_etf_hist: pd.DataFrame | None = None
+            try:
+                # Quick info fetch just to get sector name before full analyze()
+                import yfinance as _yf
+                _raw = _yf.Ticker(symbol).get_info()
+                _sector = _raw.get("sector")
+                _etf_sym = get_sector_etf(_sector)
+                if _etf_sym:
+                    if _etf_sym not in sector_etf_cache:
+                        _etf_hist, _ = fetch_history(_etf_sym)
+                        sector_etf_cache[_etf_sym] = _etf_hist
+                    sector_etf_hist = sector_etf_cache[_etf_sym]
+            except Exception:
+                pass
+
+            analysis = analyzer.analyze(
+                symbol,
+                spy_history=spy_history,
+                research_signals=signals,
+                regime_data=regime_data,
+                sector_etf_history=sector_etf_hist,
+            )
             try:
                 save_snapshot(symbol, analysis)
                 snapshots_saved += 1
@@ -85,8 +118,10 @@ def refresh_all() -> dict:
                      rising_volume_on_up_days, trend_alignment, trend_strength_score, trend_strength_label, trend_strength_summary,
                      volume_confirmation, volume_confirmation_score, volume_confirmation_summary,
                      atr, volume_ratio, relative_strength,
-                     support, resistance, distance_to_support, distance_to_resistance, pattern_signal, earnings_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     support, resistance, distance_to_support, distance_to_resistance, pattern_signal, earnings_date,
+                     earnings_signal_json, sector_rs_signal_json, regime_signal_json,
+                     insider_signal_json, fundamentals_signal_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ticker["id"],
@@ -132,6 +167,29 @@ def refresh_all() -> dict:
                         ind.get("distance_to_resistance"),
                         ind.get("pattern_signal"),
                         ind.get("earnings_date"),
+                        # New signal JSON blobs
+                        json.dumps({k: ind.get(k) for k in [
+                            "days_to_earnings", "earnings_score_modifier",
+                            "earnings_label", "earnings_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "sector_etf", "sector_rs_13w", "sector_rs_26w", "sector_rs_52w",
+                            "sector_rs_score_modifier", "sector_rs_label", "sector_rs_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "regime_label", "regime_vix", "regime_breadth_score",
+                            "regime_score_modifier", "regime_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "insider_buy_count", "insider_sell_count", "insider_net_value",
+                            "insider_score_modifier", "insider_label", "insider_summary",
+                        ]}),
+                        json.dumps({k: ind.get(k) for k in [
+                            "fundamentals_pe", "fundamentals_revenue_growth",
+                            "fundamentals_profit_margin", "fundamentals_debt_to_equity",
+                            "fundamentals_eps_growth", "fundamentals_score_modifier",
+                            "fundamentals_label", "fundamentals_summary",
+                        ]}),
                     ),
                 )
                 as_of = datetime.now(timezone.utc).isoformat()
@@ -219,6 +277,176 @@ def refresh_all() -> dict:
         )
     news = refresh_news()
     return {"refreshed": refreshed, "failed": failed, "snapshots_saved": snapshots_saved, "market": market.__dict__, "news": news}
+
+
+def refresh_symbols_list(symbols: list[str]) -> dict:
+    """
+    Run the full analysis pipeline for a specific list of symbols and persist
+    indicators + scores to the database.
+
+    Lighter than refresh_all(): no news refresh, no recommendation snapshots,
+    no global market settings update — just fresh engine data for the
+    requested symbols.  Used by the Portfolio OS "Refresh Signals" button.
+    """
+    if not symbols:
+        return {"refreshed": [], "failed": []}
+
+    normalized = [s.strip().upper() for s in symbols if s.strip()]
+
+    # Ensure every symbol has a tickers row
+    with db() as conn:
+        for sym in normalized:
+            upsert_ticker(conn, sym)
+        ticker_rows = rows_to_dicts(
+            conn.execute(
+                f"SELECT * FROM tickers WHERE symbol IN ({','.join('?' * len(normalized))})",
+                normalized,
+            ).fetchall()
+        )
+
+    if not ticker_rows:
+        return {"refreshed": [], "failed": []}
+
+    refreshed: list[str] = []
+    failed: list[dict] = []
+
+    # Shared breadth / regime data (fetched once)
+    spy_history, _ = fetch_history("SPY")
+    qqq_history, _ = fetch_history("QQQ")
+    iwm_history, _ = fetch_history("IWM")
+    spy_ind = compute_indicators(spy_history)
+    qqq_ind = compute_indicators(qqq_history)
+    iwm_ind = compute_indicators(iwm_history)
+    market = market_condition(spy_ind, qqq_ind)
+    regime_data = analyze_market_regime(spy_ind=spy_ind, qqq_ind=qqq_ind, iwm_ind=iwm_ind)
+
+    sector_etf_cache: dict[str, pd.DataFrame] = {}
+    analyzer = TechnicalZoneAnalyzer(period="2y")
+
+    for ticker in ticker_rows:
+        symbol = ticker["symbol"]
+        try:
+            with db() as conn:
+                signals = rows_to_dicts(
+                    conn.execute(
+                        "SELECT * FROM research_signals WHERE ticker_id = ? ORDER BY created_at",
+                        (ticker["id"],),
+                    ).fetchall()
+                )
+
+            # Sector ETF (cached per ETF symbol)
+            sector_etf_hist: pd.DataFrame | None = None
+            try:
+                import yfinance as _yf
+                _raw = _yf.Ticker(symbol).get_info()
+                _etf_sym = get_sector_etf(_raw.get("sector"))
+                if _etf_sym:
+                    if _etf_sym not in sector_etf_cache:
+                        _etf_hist, _ = fetch_history(_etf_sym)
+                        sector_etf_cache[_etf_sym] = _etf_hist
+                    sector_etf_hist = sector_etf_cache[_etf_sym]
+            except Exception:
+                pass
+
+            analysis = analyzer.analyze(
+                symbol,
+                spy_history=spy_history,
+                research_signals=signals,
+                regime_data=regime_data,
+                sector_etf_history=sector_etf_hist,
+            )
+            ind   = analysis.indicators
+            score = analysis.score
+
+            cache_pivots(ticker["id"], analysis.pivots)
+            cache_fib_zones(ticker["id"], analysis.fib_setup, analysis.fib_zones)
+            cache_sr_zones(ticker["id"], analysis.sr_zones)
+
+            with db() as conn:
+                if analysis.info.get("company") or analysis.info.get("asset_type"):
+                    conn.execute(
+                        "UPDATE tickers SET company = COALESCE(?, company), asset_type = COALESCE(?, asset_type) WHERE id = ?",
+                        (analysis.info.get("company"), analysis.info.get("asset_type"), ticker["id"]),
+                    )
+                for date, row in analysis.history.tail(260).iterrows():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO prices (ticker_id, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (ticker["id"], date.strftime("%Y-%m-%d"),
+                         float(row.get("Open", 0)), float(row.get("High", 0)),
+                         float(row.get("Low", 0)),  float(row.get("Close", 0)),
+                         float(row.get("Volume", 0))),
+                    )
+                conn.execute(
+                    """INSERT OR REPLACE INTO indicators
+                    (ticker_id, as_of, price, ma20, ma50, ma200, bb_upper, bb_lower, bb_width_pct,
+                     rsi, rsi_interpretation, macd, macd_signal,
+                     macd_histogram, macd_trend, momentum_score, momentum_summary, momentum_divergence,
+                     adx, plus_di, minus_di, adx_interpretation, trend_direction, obv, obv_trend, volume_vs_20d,
+                     rising_volume_on_up_days, trend_alignment, trend_strength_score, trend_strength_label, trend_strength_summary,
+                     volume_confirmation, volume_confirmation_score, volume_confirmation_summary,
+                     atr, volume_ratio, relative_strength,
+                     support, resistance, distance_to_support, distance_to_resistance, pattern_signal, earnings_date,
+                     earnings_signal_json, sector_rs_signal_json, regime_signal_json,
+                     insider_signal_json, fundamentals_signal_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        ticker["id"], ind.get("as_of"), ind.get("price"),
+                        ind.get("ma20"), ind.get("ma50"), ind.get("ma200"),
+                        ind.get("bb_upper"), ind.get("bb_lower"), ind.get("bb_width_pct"),
+                        ind.get("rsi"), ind.get("rsi_interpretation"),
+                        ind.get("macd"), ind.get("macd_signal"), ind.get("macd_histogram"), ind.get("macd_trend"),
+                        ind.get("momentum_score"), ind.get("momentum_summary"), ind.get("momentum_divergence"),
+                        ind.get("adx"), ind.get("plus_di"), ind.get("minus_di"), ind.get("adx_interpretation"), ind.get("trend_direction"),
+                        ind.get("obv"), ind.get("obv_trend"), ind.get("volume_vs_20d"),
+                        1 if ind.get("rising_volume_on_up_days") else 0,
+                        ind.get("trend_alignment"), ind.get("trend_strength_score"), ind.get("trend_strength_label"), ind.get("trend_strength_summary"),
+                        ind.get("volume_confirmation"), ind.get("volume_confirmation_score"), ind.get("volume_confirmation_summary"),
+                        ind.get("atr"), ind.get("volume_ratio"), ind.get("relative_strength"),
+                        ind.get("support"), ind.get("resistance"), ind.get("distance_to_support"), ind.get("distance_to_resistance"),
+                        ind.get("pattern_signal"), ind.get("earnings_date"),
+                        json.dumps({k: ind.get(k) for k in ["days_to_earnings", "earnings_score_modifier", "earnings_label", "earnings_summary"]}),
+                        json.dumps({k: ind.get(k) for k in ["sector_etf", "sector_rs_13w", "sector_rs_26w", "sector_rs_52w", "sector_rs_score_modifier", "sector_rs_label", "sector_rs_summary"]}),
+                        json.dumps({k: ind.get(k) for k in ["regime_label", "regime_vix", "regime_breadth_score", "regime_score_modifier", "regime_summary"]}),
+                        json.dumps({k: ind.get(k) for k in ["insider_buy_count", "insider_sell_count", "insider_net_value", "insider_score_modifier", "insider_label", "insider_summary"]}),
+                        json.dumps({k: ind.get(k) for k in ["fundamentals_pe", "fundamentals_revenue_growth", "fundamentals_profit_margin", "fundamentals_debt_to_equity", "fundamentals_eps_growth", "fundamentals_score_modifier", "fundamentals_label", "fundamentals_summary"]}),
+                    ),
+                )
+                as_of = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    """INSERT OR REPLACE INTO scores
+                    (ticker_id, as_of, score, decision, confidence, risk, trend_label, momentum_label, volume_label,
+                     news_label, summary, suggested_action, entry_range, invalidation_level, target1, target2,
+                     distance_to_buy_zone, buy_zone_confluence, setup_factor_scores, setup_positive_factors,
+                     setup_concern_factors, decision_reasons, risk_reward_summary, improve_to_buy,
+                     buy_zone_explanation, target_zone_explanation,
+                     fresh_high_targets, fresh_high_target_note,
+                     trend_strength_summary, momentum_summary, macd_trend, volume_confirmation_summary, hold_window, why_rating, changes_view)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        ticker["id"], as_of,
+                        score["score"], score["decision"], score["confidence"], score["risk"],
+                        score["trend_label"], score["momentum_label"], score["volume_label"],
+                        score["news_label"], score["summary"], score["suggested_action"],
+                        score["entry_range"], score["invalidation_level"], score["target1"], score["target2"],
+                        score["distance_to_buy_zone"], score["buy_zone_confluence"],
+                        json.dumps(score.get("setup_factor_scores") or []),
+                        json.dumps(score.get("setup_positive_factors") or []),
+                        json.dumps(score.get("setup_concern_factors") or []),
+                        json.dumps(score.get("decision_reasons") or []),
+                        score.get("risk_reward_summary"), score.get("improve_to_buy"),
+                        score["buy_zone_explanation"], score["target_zone_explanation"],
+                        1 if score.get("fresh_high_targets") else 0,
+                        score.get("fresh_high_target_note"),
+                        score.get("trend_strength_summary"), score.get("momentum_summary"),
+                        score.get("macd_trend"), score.get("volume_confirmation_summary"),
+                        score["hold_window"], score["why_rating"], score["changes_view"],
+                    ),
+                )
+            refreshed.append(symbol)
+        except Exception as exc:
+            failed.append({"symbol": symbol, "reason": str(exc)})
+
+    return {"refreshed": refreshed, "failed": failed}
 
 
 def refresh_if_empty() -> None:

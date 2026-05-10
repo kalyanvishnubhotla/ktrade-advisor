@@ -58,7 +58,7 @@ import {
   technicalSourceToPlain,
 } from './utils';
 import { useAutoRefresh } from './hooks/useAutoRefresh';
-import { getAllHoldings, getPortfolioSummary, getTransactions } from './services/portfolioService';
+import { getAllHoldings, getPortfolioSummary, getTransactions, refreshPortfolioSignals } from './services/portfolioService';
 import type { PortfolioHolding, PortfolioSummary, PortfolioTransaction, TransactionFilters } from './services/portfolioService';
 import { importPortfolioFiles, parseEtradeCSV, parseRobinhoodCSV } from './services/portfolioImportService';
 import type { ParsedTransaction, ImportResult } from './services/portfolioImportService';
@@ -1577,6 +1577,34 @@ function LearningInsightsView() {
 
 type PortfolioTab = 'overview' | 'holdings' | 'transactions' | 'import';
 
+/**
+ * Translate the engine's decision + score into calm, beginner-friendly
+ * portfolio language (you already own this stock — context matters).
+ */
+function portfolioAction(decision: string | null | undefined, score: number | null | undefined, distToBuyZone?: number | null): string {
+  if (!decision) return 'No signal yet';
+  const d = decision.toLowerCase();
+  const s = score ?? 0;
+  const dist = distToBuyZone ?? 100;
+  if (d.includes('buy') || (d.includes('wait') && dist <= 3)) {
+    return s >= 70 ? 'Strong — could add more' : 'Near your entry zone';
+  }
+  if (d.includes('wait')) return dist <= 10 ? 'Getting close to entry' : 'Hold — wait for a pullback';
+  if (d.includes('watch')) return 'Keep holding — watching';
+  if (d.includes('avoid')) return 'Worth reviewing';
+  if (d.includes('hold')) return 'Keep holding';
+  return decision;
+}
+
+/** Plain-text note about how far the stock is from its buy zone. */
+function buyZoneHint(dist: number | null | undefined): string | null {
+  if (dist == null) return null;
+  if (dist <= 0) return 'In buy zone now';
+  if (dist <= 4) return `${dist.toFixed(1)}% above entry`;
+  if (dist <= 12) return `${dist.toFixed(0)}% from entry`;
+  return null;   // too far — no hint
+}
+
 const PIE_PALETTE = [
   '#00C805', '#3B82F6', '#F5A623', '#8B5CF6',
   '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#a3a3a3',
@@ -1694,6 +1722,8 @@ function HoldingsTable({ holdings, totalValue, onSelectTicker }: {
             const pnl = h.unrealized_pnl_pct;
             const pnlUp = pnl != null && pnl >= 0;
             const hasTicker = h.current_price != null;
+            const hasSignal = h.score != null || h.decision != null;
+            const hint = buyZoneHint(h.distance_to_buy_zone);
             return (
               <tr key={h.symbol}
                 onClick={() => hasTicker && onSelectTicker(h.symbol)}
@@ -1703,6 +1733,7 @@ function HoldingsTable({ holdings, totalValue, onSelectTicker }: {
                 <td>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <b>{h.symbol}</b>
+                    {h.theme && <span style={{ fontSize: 10, color: 'var(--text-tertiary)', background: 'var(--bg-surface-4)', padding: '1px 5px', borderRadius: 4 }}>{h.theme}</span>}
                     {hasTicker && <span style={{ color: 'var(--text-tertiary)', fontSize: 10 }}>›</span>}
                   </div>
                 </td>
@@ -1713,7 +1744,28 @@ function HoldingsTable({ holdings, totalValue, onSelectTicker }: {
                   {pnl != null ? `${pnlUp ? '+' : ''}${pnl.toFixed(1)}%` : '—'}
                 </td>
                 <td style={{ fontFamily: 'var(--font-mono)' }}>{pp > 0 ? `${pp.toFixed(1)}%` : '—'}</td>
-                <td>{h.decision ? <DecisionPill decision={h.decision} /> : <span style={{ color: 'var(--text-tertiary)' }}>—</span>}</td>
+                {/* KTrade View — score badge + action + buy zone hint */}
+                <td>
+                  {hasSignal ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        {h.score != null && (
+                          <span className={`score-chip ${scoreClass(h.score)}`} style={{ fontSize: 11 }}>{h.score}</span>
+                        )}
+                        <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', fontWeight: 500 }}>
+                          {portfolioAction(h.decision, h.score, h.distance_to_buy_zone)}
+                        </span>
+                      </div>
+                      {hint && (
+                        <span style={{ fontSize: 10, color: h.distance_to_buy_zone != null && h.distance_to_buy_zone <= 0 ? 'var(--green-text)' : 'var(--gold-text)' }}>
+                          {hint}
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Run Refresh Signals</span>
+                  )}
+                </td>
               </tr>
             );
           })}
@@ -1955,6 +2007,135 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: () => vo
   );
 }
 
+// ── Portfolio Insights ────────────────────────────────────────────────────────
+function PortfolioInsights({ holdings }: { holdings: PortfolioHolding[] }) {
+  const active = holdings.filter(h => h.symbol !== 'CASH' && h.quantity > 0);
+  if (active.length === 0) return null;
+
+  // ── Signal grouping ──────────────────────────────────────────────────────
+  const withSignal = active.filter(h => h.score != null || h.decision != null);
+  const noSignal   = active.filter(h => h.score == null && h.decision == null);
+
+  // "Strong setups" — high score, actionable
+  const strong = withSignal.filter(h => (h.score ?? 0) >= 65 && (h.decision ?? '').toLowerCase().match(/buy|wait/));
+  // "Near buy zone" — within 8% of entry
+  const nearZone = withSignal.filter(h => h.distance_to_buy_zone != null && h.distance_to_buy_zone <= 8 && (h.score ?? 0) >= 50 && !strong.includes(h));
+  // "Worth watching" — decent score, not yet actionable
+  const watching = withSignal.filter(h => !strong.includes(h) && !nearZone.includes(h) && (h.score ?? 0) >= 50);
+  // "Needs review" — weak signal or Avoid
+  const review = withSignal.filter(h => !strong.includes(h) && !nearZone.includes(h) && !watching.includes(h));
+
+  // ── Theme concentration ───────────────────────────────────────────────────
+  const themeTotals: Record<string, number> = {};
+  let grandTotal = 0;
+  for (const h of active) {
+    const theme = h.theme || 'Other';
+    const val = h.quantity * (h.current_price ?? h.avg_cost_basis ?? 0);
+    themeTotals[theme] = (themeTotals[theme] ?? 0) + val;
+    grandTotal += val;
+  }
+  const themeRows = Object.entries(themeTotals)
+    .map(([theme, val]) => ({ theme, val, pct: grandTotal > 0 ? val / grandTotal * 100 : 0 }))
+    .sort((a, b) => b.pct - a.pct)
+    .slice(0, 8);
+
+  const THEME_COLORS = ['#00C805', '#3B82F6', '#F5A623', '#8B5CF6', '#06b6d4', '#ec4899', '#84cc16', '#f97316'];
+
+  // ── Signal row helper ─────────────────────────────────────────────────────
+  const SignalGroup = ({ label, items, tone, desc }: { label: string; items: PortfolioHolding[]; tone: string; desc: string }) => {
+    if (items.length === 0) return null;
+    const names = items.map(h => h.symbol).join(', ');
+    return (
+      <div style={{ padding: 'var(--space-3)', borderRadius: 8, background: 'var(--bg-surface-3)', border: `1px solid var(--border-subtle)` }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <div style={{ fontWeight: 600, fontSize: 'var(--text-sm)', color: tone }}>
+            {label} <span style={{ fontWeight: 400, color: 'var(--text-tertiary)' }}>({items.length})</span>
+          </div>
+        </div>
+        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', marginBottom: 4 }}>
+          {names}
+        </div>
+        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', fontStyle: 'italic' }}>{desc}</div>
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ display: 'flex', gap: 'var(--space-4)', flexWrap: 'wrap' }}>
+      {/* KTrade signals panel */}
+      <div className="panel" style={{ flex: '2 1 300px' }}>
+        <h3 style={{ marginBottom: 'var(--space-4)' }}>KTrade Signals on Your Holdings</h3>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+          <SignalGroup
+            label="Strong setups"
+            items={strong}
+            tone="var(--green-text)"
+            desc="The engine likes these right now. Check the entry range before adding more."
+          />
+          <SignalGroup
+            label="Getting close to a good entry"
+            items={nearZone}
+            tone="var(--gold-text)"
+            desc="Within striking distance of the buy zone. Worth keeping an eye on."
+          />
+          <SignalGroup
+            label="Keep watching"
+            items={watching}
+            tone="var(--blue-text)"
+            desc="Decent fundamentals but not quite in the zone yet. Hold steady."
+          />
+          <SignalGroup
+            label="Worth reviewing"
+            items={review}
+            tone="var(--red-text)"
+            desc="The engine is cautious here. Consider your original thesis."
+          />
+          {noSignal.length > 0 && (
+            <div style={{ padding: 'var(--space-3)', borderRadius: 8, background: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)' }}>
+              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-tertiary)', fontWeight: 600 }}>
+                No signal yet ({noSignal.length}) — {noSignal.map(h => h.symbol).join(', ')}
+              </div>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 4, fontStyle: 'italic' }}>
+                Click "Refresh Signals" to run the engine on these holdings.
+              </div>
+            </div>
+          )}
+          {withSignal.length === 0 && (
+            <div style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)', fontStyle: 'italic' }}>
+              No signals yet — use "Refresh Signals" above to analyse your holdings.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Theme concentration */}
+      {themeRows.length > 0 && (
+        <div className="panel" style={{ flex: '1 1 220px' }}>
+          <h3 style={{ marginBottom: 'var(--space-4)' }}>Concentration by Theme</h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+            {themeRows.map(({ theme, val, pct }, i) => (
+              <div key={theme}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', fontWeight: 500 }}>{theme}</span>
+                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>
+                    {formatMoney(val)} · {pct.toFixed(1)}%
+                  </span>
+                </div>
+                <div style={{ height: 6, background: 'var(--bg-surface-4)', borderRadius: 4, overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${Math.min(100, pct)}%`, background: THEME_COLORS[i % THEME_COLORS.length], borderRadius: 4, transition: 'width 0.4s ease' }} />
+                </div>
+                {pct > 35 && (
+                  <div style={{ fontSize: 10, color: 'var(--gold-text)', marginTop: 3 }}>⚠ Over 35% concentration</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Portfolio overview tab ────────────────────────────────────────────────────
 function PortfolioOverviewTab({ holdings, summary }: { holdings: PortfolioHolding[]; summary: PortfolioSummary | null }) {
   if (!summary || summary.totalCost === 0) return (
@@ -2017,6 +2198,9 @@ function PortfolioOverviewTab({ holdings, summary }: { holdings: PortfolioHoldin
         </div>
       </div>
 
+      {/* Insights */}
+      <PortfolioInsights holdings={holdings} />
+
       {/* Performance placeholder */}
       <div className="panel" style={{ background: 'var(--bg-surface-3)', padding: 'var(--space-3) var(--space-4)' }}>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -2036,6 +2220,8 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
   const [holdings, setHoldings] = useState<PortfolioHolding[]>([]);
   const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [loadingData, setLoadingData] = useState(true);
+  const [refreshingSignals, setRefreshingSignals] = useState(false);
+  const [signalToast, setSignalToast] = useState('');
 
   const reload = async () => {
     setLoadingData(true);
@@ -2043,6 +2229,21 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
       const [h, s] = await Promise.all([getAllHoldings(), getPortfolioSummary()]);
       setHoldings(h); setSummary(s);
     } finally { setLoadingData(false); }
+  };
+
+  const doRefreshSignals = async () => {
+    setRefreshingSignals(true);
+    setSignalToast('');
+    try {
+      const res = await refreshPortfolioSignals();
+      await reload();   // pull fresh enriched holdings after engine run
+      setSignalToast(`Signals updated for ${res.refreshed_count} holding${res.refreshed_count !== 1 ? 's' : ''}${res.failed_count > 0 ? ` · ${res.failed_count} failed` : ''}.`);
+      window.setTimeout(() => setSignalToast(''), 5000);
+    } catch (e) {
+      setSignalToast(e instanceof Error ? e.message : 'Refresh failed');
+    } finally {
+      setRefreshingSignals(false);
+    }
   };
 
   useEffect(() => { reload(); }, []);
@@ -2056,9 +2257,23 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
     <section className="stack">
       <div className="section-head">
         <div><h3>Portfolio OS</h3><p>Track holdings, P&L, and get KTrade recommendations for every position</p></div>
-        <button className="btn btn-ghost btn-sm" onClick={reload}>
-          <RefreshCw size={14} className={loadingData ? 'spinning' : ''} />Reload
-        </button>
+        <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center', flexWrap: 'wrap' }}>
+          {signalToast && (
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--green-text)' }}>{signalToast}</span>
+          )}
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={doRefreshSignals}
+            disabled={refreshingSignals || loadingData}
+            title="Run the KTrade engine on all your current holdings. Takes 30–90 seconds."
+          >
+            <RefreshCw size={14} className={refreshingSignals ? 'spinning' : ''} />
+            {refreshingSignals ? 'Analysing…' : 'Refresh Signals'}
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={reload}>
+            <RefreshCw size={14} className={loadingData && !refreshingSignals ? 'spinning' : ''} />Reload
+          </button>
+        </div>
       </div>
 
       {/* Tab nav */}

@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from .analysis import DISCLAIMER
 from .database import ROOT, db, init_db, rows_to_dicts, seed_defaults, upsert_ticker
 from .fibonacci import cached_fib_zones
-from .market_data import refresh_all
+from .market_data import refresh_all, refresh_symbols_list
 from .news import RSS_SOURCES, latest_news, news_for_ticker, refresh_news
 from .pivots import cached_pivots, major_swings
 from .recommendation_snapshots import (
@@ -866,12 +866,17 @@ def get_portfolio_holdings() -> list[dict]:
                 "SELECT * FROM portfolio_holdings ORDER BY symbol"
             ).fetchall()
         )
-    # Enrich with current price and engine score where available
+    # Enrich with full engine signal where available
     with db() as conn:
         for h in holdings:
             row = conn.execute(
-                """SELECT i.price, s.score, s.decision, s.entry_range,
-                          s.target1, s.invalidation_level
+                """SELECT t.theme,
+                          i.price,
+                          s.score, s.decision, s.confidence, s.risk,
+                          s.entry_range, s.target1, s.invalidation_level,
+                          s.distance_to_buy_zone, s.buy_zone_confluence,
+                          s.suggested_action, s.summary,
+                          s.improve_to_buy, s.hold_window
                    FROM tickers t
                    LEFT JOIN indicators i ON i.ticker_id = t.id
                    LEFT JOIN scores s ON s.id = (
@@ -881,12 +886,21 @@ def get_portfolio_holdings() -> list[dict]:
                 (h["symbol"],),
             ).fetchone()
             if row:
-                h["current_price"]     = row["price"]
-                h["score"]             = row["score"]
-                h["decision"]          = row["decision"]
-                h["entry_range"]       = row["entry_range"]
-                h["target1"]           = row["target1"]
-                h["invalidation_level"] = row["invalidation_level"]
+                h["theme"]                = row["theme"]
+                h["current_price"]        = row["price"]
+                h["score"]                = row["score"]
+                h["decision"]             = row["decision"]
+                h["confidence"]           = row["confidence"]
+                h["risk"]                 = row["risk"]
+                h["entry_range"]          = row["entry_range"]
+                h["target1"]              = row["target1"]
+                h["invalidation_level"]   = row["invalidation_level"]
+                h["distance_to_buy_zone"] = row["distance_to_buy_zone"]
+                h["buy_zone_confluence"]  = row["buy_zone_confluence"]
+                h["suggested_action"]     = row["suggested_action"]
+                h["summary"]              = row["summary"]
+                h["improve_to_buy"]       = row["improve_to_buy"]
+                h["hold_window"]          = row["hold_window"]
                 if row["price"] and h.get("avg_cost_basis"):
                     h["unrealized_pnl_pct"] = round(
                         (row["price"] / h["avg_cost_basis"] - 1) * 100, 2
@@ -945,6 +959,37 @@ def portfolio_recalculate() -> dict:
             _recalculate_holding(conn, sym)
             refreshed += 1
     return {"refreshed": refreshed, "symbols": symbols}
+
+
+@app.post("/api/portfolio/refresh-signals")
+def portfolio_refresh_signals() -> dict:
+    """
+    Fetch fresh engine analysis (indicators + scores) for every symbol
+    currently in portfolio_holdings with qty > 0.
+
+    Runs in the background-compatible way: the frontend should poll or
+    wait on the response.  Skips news / snapshots so it finishes faster
+    than a full refresh.
+    """
+    with db() as conn:
+        symbols = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT symbol FROM portfolio_holdings "
+                "WHERE symbol IS NOT NULL AND symbol != 'CASH' AND quantity > 0"
+            ).fetchall()
+        ]
+
+    if not symbols:
+        return {"refreshed": [], "failed": [], "message": "No active holdings to refresh"}
+
+    result = refresh_symbols_list(symbols)
+    return {
+        "refreshed": result["refreshed"],
+        "failed": result["failed"],
+        "refreshed_count": len(result["refreshed"]),
+        "failed_count": len(result["failed"]),
+    }
 
 
 @app.get("/api/portfolio/summary")

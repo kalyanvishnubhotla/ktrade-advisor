@@ -21,13 +21,22 @@ export interface PortfolioHolding {
   sources:               string | null;       // comma-separated broker names
   last_transaction_date: string | null;
 
-  // Enriched by engine (may be absent if symbol not in watchlists)
+  // Enriched by engine (absent if symbol not yet in tickers table)
+  theme?:                string | null;       // e.g. "AI", "Cybersecurity"
   current_price?:        number | null;
-  score?:                number | null;
-  decision?:             string | null;
+  score?:                number | null;       // 0–100 setup quality
+  decision?:             string | null;       // Buy / Wait / Watch / Avoid / Hold
+  confidence?:           string | null;
+  risk?:                 string | null;
   entry_range?:          string | null;
   target1?:              string | null;
   invalidation_level?:   string | null;
+  distance_to_buy_zone?: number | null;       // % above buy zone centre (0 = in zone)
+  buy_zone_confluence?:  number | null;
+  suggested_action?:     string | null;
+  summary?:              string | null;
+  improve_to_buy?:       string | null;
+  hold_window?:          string | null;
   unrealized_pnl_pct?:   number | null;
 }
 
@@ -109,6 +118,22 @@ export async function recalculateHoldings(): Promise<void> {
  */
 export async function getPortfolioSummary(): Promise<PortfolioSummary> {
   return apiFetch<PortfolioSummary>('/api/portfolio/summary');
+}
+
+/**
+ * Run fresh engine analysis on every active portfolio holding.
+ * Uses the backend refresh pipeline (indicators + scores) without
+ * touching news or global watchlist data.
+ *
+ * This can take 30–90 seconds depending on how many holdings you have.
+ */
+export async function refreshPortfolioSignals(): Promise<{
+  refreshed_count: number;
+  failed_count: number;
+  refreshed: string[];
+  failed: Array<{ symbol: string; reason: string }>;
+}> {
+  return apiFetch('/api/portfolio/refresh-signals', { method: 'POST' });
 }
 
 /**
