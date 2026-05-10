@@ -1678,7 +1678,7 @@ function PortfolioUploadView() {
 // ── SettingsView ──────────────────────────────────────────────────────────────
 function SettingsView() {
   const [positions, setPositions] = useState<any>(null);
-  const [settings, setSettings] = useState<{ show_beginner_price_help: boolean } | null>(null);
+  const [settings, setSettings] = useState<{ show_beginner_price_help: boolean; enable_portfolio_os: boolean } | null>(null);
   const [form, setForm] = useState({ ticker: '', shares: '', cost: '', theme: '' });
 
   const load = async () => {
@@ -1712,8 +1712,31 @@ function SettingsView() {
               checked={Boolean(settings?.show_beginner_price_help)}
               onChange={async (e) => {
                 const next = e.target.checked;
-                setSettings({ show_beginner_price_help: next });
+                setSettings(s => s ? { ...s, show_beginner_price_help: next } : s);
                 await sendJson('/api/settings/show_beginner_price_help', { value: String(next) }, 'PATCH');
+              }}
+            />
+          </label>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'var(--space-3)', padding: 'var(--space-3) 0' }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600, marginBottom: 4 }}>Enable Portfolio Operating System</div>
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
+              Unlock the Portfolio OS tab to import broker CSV exports (Robinhood, E*Trade), track your holdings,
+              and get hold/sell recommendations based on current engine scores. Off by default.
+            </div>
+          </div>
+          <label className="toggle setting-toggle">
+            <input
+              type="checkbox"
+              checked={Boolean(settings?.enable_portfolio_os)}
+              onChange={async (e) => {
+                const next = e.target.checked;
+                setSettings(s => s ? { ...s, enable_portfolio_os: next } : s);
+                await sendJson('/api/settings/enablePortfolioOS', { value: String(next) }, 'PATCH');
+                // Reload the page so the nav tab appears/disappears immediately
+                window.location.reload();
               }}
             />
           </label>
@@ -1807,6 +1830,7 @@ function App() {
 
   const cards = dashboard?.cards ?? [];
   const showHelp = dashboard?.settings?.show_beginner_price_help ?? true;
+  const portfolioOSEnabled = dashboard?.settings?.enable_portfolio_os ?? false;
 
   // Market label → regime class
   const marketLabel = (dashboard?.market.label || '').toLowerCase();
@@ -1830,7 +1854,9 @@ function App() {
           <NavButton page="watchlists" current={page} setPage={setPage} icon={<ListPlus size={16} />} label="Watchlists" />
           <NavButton page="ticker" current={page} setPage={setPage} icon={<Search size={16} />} label="Ticker Detail" />
           <NavButton page="research" current={page} setPage={setPage} icon={<BookOpen size={16} />} label="Research Signal" />
-          <NavButton page="portfolio" current={page} setPage={setPage} icon={<Upload size={16} />} label="Portfolio Upload" />
+          {portfolioOSEnabled && (
+            <NavButton page="portfolio" current={page} setPage={setPage} icon={<Upload size={16} />} label="Portfolio OS" />
+          )}
           <NavButton page="history" current={page} setPage={setPage} icon={<History size={16} />} label="History" />
           <NavButton page="learningInsights" current={page} setPage={setPage} icon={<Target size={16} />} label="Learning" />
           <NavButton page="settings" current={page} setPage={setPage} icon={<Settings size={16} />} label="Settings" />
@@ -1883,7 +1909,7 @@ function App() {
           {page === 'watchlists' && <WatchlistsView reload={load} />}
           {page === 'ticker' && <TickerView symbol={selectedTicker} setSymbol={setSelectedTicker} />}
           {page === 'research' && <ResearchView />}
-          {page === 'portfolio' && <PortfolioUploadView />}
+          {page === 'portfolio' && portfolioOSEnabled && <PortfolioUploadView />}
           {page === 'history' && <HistoryView />}
           {page === 'learningInsights' && <LearningInsightsView />}
           {page === 'settings' && <SettingsView />}

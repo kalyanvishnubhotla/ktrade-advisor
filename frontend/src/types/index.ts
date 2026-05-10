@@ -171,7 +171,7 @@ export type Dashboard = {
     error?: string;
     latest: NewsItem[];
   };
-  settings: { show_beginner_price_help: boolean };
+  settings: { show_beginner_price_help: boolean; enable_portfolio_os: boolean };
   cards: Card[];
   watchlists: Watchlist[];
   disclaimer: string;

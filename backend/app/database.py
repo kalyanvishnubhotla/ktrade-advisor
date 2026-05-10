@@ -301,6 +301,34 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS portfolio_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                broker TEXT NOT NULL,
+                file_name TEXT,
+                import_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                transaction_date DATE,
+                symbol TEXT,
+                type TEXT,
+                quantity REAL,
+                price REAL,
+                amount REAL,
+                raw_data JSON,
+                notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS portfolio_holdings (
+                symbol TEXT PRIMARY KEY,
+                quantity REAL NOT NULL DEFAULT 0,
+                avg_cost_basis REAL,
+                total_cost REAL,
+                last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sources TEXT,
+                last_transaction_date DATE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_portfolio_tx_symbol ON portfolio_transactions(symbol);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_tx_date ON portfolio_transactions(transaction_date);
             """
         )
         indicator_existing = [row["name"] for row in conn.execute("PRAGMA table_info(indicators)").fetchall()]
