@@ -1697,8 +1697,10 @@ function HoldingsTable({ holdings, totalValue, onSelectTicker }: {
     </th>
   );
   if (!holdings.length) return (
-    <div className="panel" style={{ textAlign: 'center', color: 'var(--text-tertiary)', padding: 'var(--space-8)' }}>
-      No holdings yet. Go to the <b>Import</b> tab to upload your broker CSV.
+    <div style={{ textAlign: 'center', padding: 'var(--space-10) var(--space-8)', color: 'var(--text-tertiary)' }}>
+      <Briefcase size={36} style={{ opacity: 0.3, marginBottom: 12 }} />
+      <div style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8 }}>No holdings yet</div>
+      <div style={{ fontSize: 'var(--text-sm)' }}>Go to the <b style={{ color: 'var(--text-primary)' }}>Import</b> tab to upload your first broker CSV.</div>
     </div>
   );
   return (
@@ -1853,12 +1855,13 @@ interface FilePreview {
   symbols: string[]; dateRange: string; parsed: ParsedTransaction[];
 }
 
-function PortfolioImportPanel({ onImportComplete }: { onImportComplete: () => void }) {
+function PortfolioImportPanel({ onImportComplete }: { onImportComplete: (result: ImportResult) => void }) {
   const [dragOver, setDragOver] = useState(false);
   const [previews, setPreviews] = useState<FilePreview[]>([]);
   const [importing, setImporting] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [error, setError] = useState('');
+  const [showExportHelp, setShowExportHelp] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const processFiles = async (files: File[]) => {
@@ -1870,10 +1873,12 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: () => vo
       const rh = parseRobinhoodCSV(text, f.name);
       const parsed = et.length >= rh.length ? et : rh;
       const broker = et.length >= rh.length ? 'E*TRADE' : 'Robinhood';
+      // Fallback: if neither parser got results, flag as unknown
+      const finalBroker = parsed.length ? broker : 'Unknown — check format';
       const syms = [...new Set(parsed.map(t => t.symbol))].filter(Boolean).sort();
       const dates = parsed.map(t => t.transaction_date).filter(Boolean).sort();
       const dateRange = dates.length ? `${dates[0]} → ${dates[dates.length - 1]}` : '—';
-      ps.push({ file: f, broker: parsed.length ? broker : 'Unknown', count: parsed.length, symbols: syms, dateRange, parsed });
+      ps.push({ file: f, broker: finalBroker, count: parsed.length, symbols: syms, dateRange, parsed });
     }
     setPreviews(ps);
   };
@@ -1883,7 +1888,7 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: () => vo
     try {
       const res = await importPortfolioFiles(previews.map(p => p.file));
       setResult(res);
-      onImportComplete();
+      onImportComplete(res);   // bubble result up so PortfolioOS can show toast
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Import failed');
     } finally { setImporting(false); }
@@ -1891,16 +1896,51 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: () => vo
 
   const clear = () => { setPreviews([]); setResult(null); setError(''); };
   const totalTxns = previews.reduce((s, p) => s + p.count, 0);
+  const unknownFiles = previews.filter(p => p.broker.startsWith('Unknown'));
 
   return (
     <div className="stack" style={{ gap: 'var(--space-4)' }}>
+      {/* Broker info + export help */}
       <div className="panel">
-        <h3>Supported Brokers</h3>
-        <div className="broker-chips">
-          {['Robinhood CSV', 'E*TRADE CSV'].map(b => <span key={b} className="broker-chip">{b}</span>)}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
+          <div>
+            <h3>Supported Brokers</h3>
+            <div className="broker-chips" style={{ marginTop: 'var(--space-2)' }}>
+              {['Robinhood CSV', 'E*TRADE CSV'].map(b => <span key={b} className="broker-chip">{b}</span>)}
+            </div>
+          </div>
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => setShowExportHelp(h => !h)}
+          >
+            {showExportHelp ? 'Hide' : 'How to export →'}
+          </button>
         </div>
+
+        {showExportHelp && (
+          <div style={{ marginTop: 'var(--space-4)', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 'var(--space-3)' }}>
+            {[
+              {
+                broker: 'Robinhood',
+                steps: ['Open the Robinhood app or website', 'Tap Account → Statements & History', 'Find Account Activity → tap Download', 'Save the CSV, then drop it below'],
+              },
+              {
+                broker: 'E*TRADE',
+                steps: ['Log in at etrade.com', 'Go to Accounts → Documents', 'Choose Brokerage Download', 'Export as CSV, then drop it below'],
+              },
+            ].map(({ broker, steps }) => (
+              <div key={broker} style={{ background: 'var(--bg-surface-3)', borderRadius: 10, padding: 'var(--space-4)' }}>
+                <div style={{ fontWeight: 600, fontSize: 'var(--text-sm)', marginBottom: 'var(--space-2)' }}>{broker}</div>
+                <ol style={{ margin: 0, paddingLeft: 18, fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', lineHeight: 1.9 }}>
+                  {steps.map(s => <li key={s}>{s}</li>)}
+                </ol>
+              </div>
+            ))}
+          </div>
+        )}
+
         <p style={{ marginTop: 'var(--space-3)', fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
-          All data stays on your machine. Files are parsed locally; only the parsed transactions reach the local backend.
+          Nothing leaves your Mac — files are parsed in the browser; only the parsed transactions are sent to the local backend.
         </p>
       </div>
 
@@ -1975,34 +2015,126 @@ function PortfolioImportPanel({ onImportComplete }: { onImportComplete: () => vo
             </>
           )}
 
+          {unknownFiles.length > 0 && (
+            <div className="alert" style={{ background: 'var(--gold-muted)', borderColor: 'var(--gold-dim)', color: 'var(--gold-text)' }}>
+              <ShieldAlert size={16} />
+              {unknownFiles.length === 1 ? `"${unknownFiles[0].file.name}"` : `${unknownFiles.length} files`} couldn't be recognised. Make sure you exported a <b>Transaction History</b> CSV (not a positions or balance CSV).
+            </div>
+          )}
           {error && <div className="alert"><ShieldAlert size={16} />{error}</div>}
 
-          <div style={{ display: 'flex', gap: 'var(--space-3)', justifyContent: 'flex-end' }}>
-            <button className="btn btn-ghost" onClick={clear}>Cancel</button>
+          <div style={{ display: 'flex', gap: 'var(--space-3)', justifyContent: 'flex-end', alignItems: 'center' }}>
+            {importing && <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Saving transactions and recalculating holdings…</span>}
+            <button className="btn btn-ghost" onClick={clear} disabled={importing}>Cancel</button>
             <button className="btn btn-primary" onClick={doImport} disabled={importing || totalTxns === 0}>
               {importing ? <RefreshCw size={16} className="spinning" /> : <Upload size={16} />}
-              {importing ? 'Importing…' : `Import ${totalTxns} transactions`}
+              {importing ? 'Importing…' : `Import ${totalTxns} transaction${totalTxns !== 1 ? 's' : ''}`}
             </button>
           </div>
         </>
       )}
 
-      {/* Success result */}
+      {/* Success result — stays visible so user can confirm, then import more */}
       {result && (
         <div className="panel" style={{ borderColor: 'var(--green-dim)', background: 'var(--green-muted)' }}>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
             <CheckCircle2 size={20} style={{ color: 'var(--green-text)', flexShrink: 0, marginTop: 2 }} />
             <div>
-              <div style={{ fontWeight: 700, color: 'var(--green-text)' }}>Import complete</div>
-              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', marginTop: 4 }}>
-                {result.success} transactions saved · {result.failed} skipped
-                {result.newHoldings.length > 0 && ` · New positions: ${result.newHoldings.join(', ')}`}
+              <div style={{ fontWeight: 700, color: 'var(--green-text)', marginBottom: 4 }}>Import complete</div>
+              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+                {result.success} transaction{result.success !== 1 ? 's' : ''} saved
+                {result.failed > 0 && ` · ${result.failed} skipped (duplicates)`}
+              </div>
+              {result.newHoldings.length > 0 && (
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--green-text)', marginTop: 6, fontWeight: 600 }}>
+                  {result.newHoldings.length} new position{result.newHoldings.length !== 1 ? 's' : ''} added: {result.newHoldings.join(', ')}
+                </div>
+              )}
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 8 }}>
+                Your Holdings tab is up to date. Click <b>Refresh Signals</b> to get live prices and KTrade scores.
               </div>
             </div>
           </div>
           <button className="btn btn-ghost btn-sm" style={{ marginTop: 'var(--space-3)' }} onClick={clear}>Import more files</button>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Portfolio Empty State ─────────────────────────────────────────────────────
+function PortfolioEmptyState({ onGoToImport }: { onGoToImport: () => void }) {
+  const [showHelp, setShowHelp] = useState(false);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 'var(--space-6)', padding: 'var(--space-10) var(--space-8)', maxWidth: 600, margin: '0 auto' }}>
+      {/* Icon */}
+      <div style={{ width: 72, height: 72, borderRadius: '50%', background: 'var(--bg-surface-3)', border: '1px solid var(--border-default)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <Briefcase size={32} style={{ color: 'var(--blue-text)' }} />
+      </div>
+
+      {/* Headline */}
+      <div style={{ textAlign: 'center' }}>
+        <h2 style={{ fontSize: 'var(--text-xl)', fontWeight: 700, marginBottom: 8 }}>Your portfolio, organized</h2>
+        <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', lineHeight: 1.6, maxWidth: 440 }}>
+          Import your transaction history from E*TRADE or Robinhood and get a clear picture of your positions, cost basis, and P&L — all stored locally on your Mac.
+        </p>
+      </div>
+
+      {/* Value props */}
+      <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap', justifyContent: 'center' }}>
+        {[
+          { icon: '📊', label: 'Cost basis tracking', desc: 'Weighted-average across all buys and sells' },
+          { icon: '💰', label: 'Unrealized P&L', desc: 'Live gain/loss once you refresh prices' },
+          { icon: '🔍', label: 'KTrade analysis', desc: 'Engine scores for every holding you own' },
+        ].map(({ icon, label, desc }) => (
+          <div key={label} style={{ flex: '1 1 140px', background: 'var(--bg-surface-2)', border: '1px solid var(--border-subtle)', borderRadius: 12, padding: 'var(--space-4)', textAlign: 'center' }}>
+            <div style={{ fontSize: 22, marginBottom: 6 }}>{icon}</div>
+            <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600, marginBottom: 4 }}>{label}</div>
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>{desc}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* CTA */}
+      <button className="btn btn-primary" onClick={onGoToImport} style={{ fontSize: 'var(--text-md)', padding: '12px 28px' }}>
+        <Upload size={18} />Upload your first CSV
+      </button>
+
+      {/* How to export help */}
+      <div style={{ width: '100%', maxWidth: 460 }}>
+        <button
+          onClick={() => setShowHelp(h => !h)}
+          style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: 'var(--text-xs)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, margin: '0 auto' }}
+        >
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10 }}>{showHelp ? '▲' : '▼'}</span>
+          How do I export my transaction history?
+        </button>
+        {showHelp && (
+          <div style={{ marginTop: 'var(--space-3)', display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+            {[
+              {
+                broker: 'Robinhood',
+                steps: ['Open the app or robinhood.com', 'Go to Account → Statements & History', 'Select "Download" next to Account Activity', 'Save the .csv file and drag it here'],
+              },
+              {
+                broker: 'E*TRADE',
+                steps: ['Log in at etrade.com', 'Go to Accounts → Documents', 'Choose "Brokerage Download" or "Transaction History"', 'Export as CSV and drag it here'],
+              },
+            ].map(({ broker, steps }) => (
+              <div key={broker} style={{ background: 'var(--bg-surface-2)', border: '1px solid var(--border-subtle)', borderRadius: 10, padding: 'var(--space-4)' }}>
+                <div style={{ fontWeight: 600, fontSize: 'var(--text-sm)', marginBottom: 'var(--space-2)' }}>{broker}</div>
+                <ol style={{ margin: 0, paddingLeft: 18, fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', lineHeight: 1.8 }}>
+                  {steps.map(s => <li key={s}>{s}</li>)}
+                </ol>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textAlign: 'center', marginTop: 'var(--space-2)' }}>
+        Nothing leaves your Mac. All data is stored locally in SQLite.
+      </p>
     </div>
   );
 }
@@ -2137,52 +2269,123 @@ function PortfolioInsights({ holdings }: { holdings: PortfolioHolding[] }) {
 }
 
 // ── Portfolio overview tab ────────────────────────────────────────────────────
-function PortfolioOverviewTab({ holdings, summary }: { holdings: PortfolioHolding[]; summary: PortfolioSummary | null }) {
-  if (!summary || summary.totalCost === 0) return (
-    <div className="panel" style={{ textAlign: 'center', color: 'var(--text-tertiary)', padding: 'var(--space-8)' }}>
-      No holdings yet. Go to the <b>Import</b> tab to upload your broker CSV.
-    </div>
-  );
-  const plUp = summary.unrealizedPL >= 0;
+function PortfolioOverviewTab({
+  holdings, summary, onGoToImport, onGoToRefresh,
+}: {
+  holdings: PortfolioHolding[];
+  summary: PortfolioSummary | null;
+  onGoToImport: () => void;
+  onGoToRefresh: () => void;
+}) {
+  // ── Empty state ───────────────────────────────────────────────────────────
+  if (!summary || summary.totalCost === 0) {
+    return <PortfolioEmptyState onGoToImport={onGoToImport} />;
+  }
+
   const ranked = holdings.filter(h => h.symbol !== 'CASH' && h.quantity > 0);
-  const topGainer = [...ranked].sort((a, b) => (b.unrealized_pnl_pct ?? -999) - (a.unrealized_pnl_pct ?? -999))[0];
-  const topLoser  = [...ranked].sort((a, b) => (a.unrealized_pnl_pct ?? 999) - (b.unrealized_pnl_pct ?? 999))[0];
+  const unpriced = ranked.filter(h => h.current_price == null);
+  const plUp = summary.unrealizedPL >= 0;
+
+  // Quick-insight data
+  const priced = ranked.filter(h => h.unrealized_pnl_pct != null);
+  const topGainer = [...priced].sort((a, b) => (b.unrealized_pnl_pct ?? -999) - (a.unrealized_pnl_pct ?? -999))[0];
+  const topLoser  = [...priced].sort((a, b) => (a.unrealized_pnl_pct ?? 999) - (b.unrealized_pnl_pct ?? 999))[0];
   const topPick   = [...ranked].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).find(h => h.score != null);
   const buyReady  = ranked.filter(h => (h.decision ?? '').toLowerCase().includes('buy')).length;
-  const atRisk    = ranked.filter(h => h.unrealized_pnl_pct != null && h.unrealized_pnl_pct < -15).length;
+  const atRisk    = priced.filter(h => (h.unrealized_pnl_pct ?? 0) < -15).length;
+
+  // When current_price is missing, fall back to cost basis so value is never $0
+  const effectiveValue = summary.totalValue > 0 ? summary.totalValue : summary.totalCost;
+  const hasPrices = unpriced.length < ranked.length;
+
   return (
     <div className="stack" style={{ gap: 'var(--space-4)' }}>
+
+      {/* "Needs refresh" nudge — only when no live prices yet */}
+      {unpriced.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: 'var(--space-3) var(--space-4)', background: 'var(--gold-muted)', border: '1px solid var(--gold-dim)', borderRadius: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <RefreshCw size={14} style={{ color: 'var(--gold-text)', flexShrink: 0 }} />
+            <span style={{ fontSize: 'var(--text-sm)', color: 'var(--gold-text)' }}>
+              <b>{unpriced.length} of {ranked.length}</b> holding{unpriced.length !== 1 ? 's' : ''} {unpriced.length === ranked.length ? "haven't been analysed yet" : 'still need analysis'}. Live prices and P&L will appear after you run Refresh Signals.
+            </span>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onGoToRefresh} style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>
+            Refresh Signals
+          </button>
+        </div>
+      )}
+
       {/* KPI row */}
       <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
-        <PortfolioKPI label="Total Value"    value={formatMoney(summary.totalValue)}   sub={`Cost basis ${formatMoney(summary.totalCost)}`} accent="blue" />
-        <PortfolioKPI label="Unrealized P&L" value={formatMoney(summary.unrealizedPL)} sub={`${plUp ? '+' : ''}${summary.unrealizedPLPercent.toFixed(1)}% overall`} up={plUp} accent={plUp ? 'green' : 'red'} />
-        <PortfolioKPI label="Cash / Other"   value={formatMoney(summary.cashBalance)}  accent="gold" />
-        <PortfolioKPI label="Holdings"       value={String(ranked.length)}             sub={`${buyReady} in Buy range`} accent="blue" />
+        <PortfolioKPI
+          label={hasPrices ? 'Market Value' : 'Cost Basis (Total)'}
+          value={formatMoney(effectiveValue)}
+          sub={hasPrices ? `Cost basis ${formatMoney(summary.totalCost)}` : `${ranked.length} position${ranked.length !== 1 ? 's' : ''} tracked`}
+          accent="blue"
+        />
+        {hasPrices ? (
+          <PortfolioKPI
+            label="Unrealized P&L"
+            value={formatMoney(summary.unrealizedPL)}
+            sub={`${plUp ? '+' : ''}${summary.unrealizedPLPercent.toFixed(1)}% overall`}
+            up={plUp}
+            accent={plUp ? 'green' : 'red'}
+          />
+        ) : (
+          <PortfolioKPI
+            label="Unrealized P&L"
+            value="Run Refresh"
+            sub="Live prices needed"
+            accent="gold"
+          />
+        )}
+        <PortfolioKPI label="Cash / Other"  value={formatMoney(summary.cashBalance)}  accent="gold" />
+        <PortfolioKPI label="Holdings"      value={String(ranked.length)}
+          sub={buyReady > 0 ? `${buyReady} in Buy range` : 'Run Refresh Signals for analysis'}
+          accent="blue"
+        />
       </div>
 
-      {/* Chart + insights row */}
+      {/* Chart + Quick Insights */}
       <div style={{ display: 'flex', gap: 'var(--space-4)', flexWrap: 'wrap' }}>
         <div className="panel" style={{ flex: '2 1 300px' }}>
           <h3 style={{ marginBottom: 'var(--space-3)' }}>Allocation</h3>
-          <AllocationPie holdings={holdings} totalValue={summary.totalValue} />
+          <AllocationPie holdings={holdings} totalValue={effectiveValue} />
         </div>
         <div className="panel" style={{ flex: '1 1 220px', display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
-          <h3>Quick Insights</h3>
-          {topGainer && topGainer.unrealized_pnl_pct != null && (
+          <h3>Quick Look</h3>
+
+          {/* Always-available rows — largest position by cost */}
+          {ranked.length > 0 && (() => {
+            const largest = [...ranked].sort((a, b) => (b.total_cost ?? 0) - (a.total_cost ?? 0))[0];
+            const pct = summary.totalCost > 0 ? ((largest.total_cost ?? 0) / summary.totalCost * 100) : 0;
+            return (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 'var(--space-2) 0', borderBottom: '1px solid var(--border-subtle)' }}>
+                <div><div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Largest position</div><div style={{ fontWeight: 700 }}>{largest.symbol}</div></div>
+                <span style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>{pct.toFixed(1)}% of cost</span>
+              </div>
+            );
+          })()}
+
+          {/* Price-dependent rows */}
+          {topGainer && topGainer.symbol !== topLoser?.symbol && (
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 'var(--space-2) 0', borderBottom: '1px solid var(--border-subtle)' }}>
-              <div><div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Top Gainer</div><div style={{ fontWeight: 700 }}>{topGainer.symbol}</div></div>
-              <span style={{ color: 'var(--green-text)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>+{topGainer.unrealized_pnl_pct.toFixed(1)}%</span>
+              <div><div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Top gainer</div><div style={{ fontWeight: 700 }}>{topGainer.symbol}</div></div>
+              <span style={{ color: 'var(--green-text)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>+{topGainer.unrealized_pnl_pct!.toFixed(1)}%</span>
             </div>
           )}
-          {topLoser && topLoser.symbol !== topGainer?.symbol && topLoser.unrealized_pnl_pct != null && (
+          {topLoser && topLoser.symbol !== topGainer?.symbol && (
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 'var(--space-2) 0', borderBottom: '1px solid var(--border-subtle)' }}>
-              <div><div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Biggest Drag</div><div style={{ fontWeight: 700 }}>{topLoser.symbol}</div></div>
-              <span style={{ color: 'var(--red-text)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{topLoser.unrealized_pnl_pct.toFixed(1)}%</span>
+              <div><div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Biggest drag</div><div style={{ fontWeight: 700 }}>{topLoser.symbol}</div></div>
+              <span style={{ color: 'var(--red-text)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{topLoser.unrealized_pnl_pct!.toFixed(1)}%</span>
             </div>
           )}
+
+          {/* Engine-dependent rows */}
           {topPick && (
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 'var(--space-2) 0', borderBottom: '1px solid var(--border-subtle)' }}>
-              <div><div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Top KTrade Score</div><div style={{ fontWeight: 700 }}>{topPick.symbol}</div></div>
+              <div><div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Best KTrade score</div><div style={{ fontWeight: 700 }}>{topPick.symbol}</div></div>
               <span className={`score-chip ${scoreClass(topPick.score ?? undefined)}`}>{topPick.score}</span>
             </div>
           )}
@@ -2192,13 +2395,17 @@ function PortfolioOverviewTab({ holdings, summary }: { holdings: PortfolioHoldin
               <span style={{ fontSize: 'var(--text-xs)', color: 'var(--red-text)' }}>{atRisk} position{atRisk > 1 ? 's' : ''} down more than 15%</span>
             </div>
           )}
-          {!topGainer && !topPick && (
-            <div style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-xs)' }}>Run Refresh to get engine scores for your holdings.</div>
+
+          {/* Offline-safe fallback */}
+          {!topGainer && !topPick && !unpriced.length && (
+            <div style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-xs)', fontStyle: 'italic' }}>
+              All looking steady. Run Refresh Signals for live scores.
+            </div>
           )}
         </div>
       </div>
 
-      {/* Insights */}
+      {/* KTrade signal insights */}
       <PortfolioInsights holdings={holdings} />
 
       {/* Performance placeholder */}
@@ -2206,7 +2413,7 @@ function PortfolioOverviewTab({ holdings, summary }: { holdings: PortfolioHoldin
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <Clock size={14} style={{ color: 'var(--text-tertiary)' }} />
           <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
-            <b style={{ color: 'var(--text-secondary)' }}>Performance chart</b> — historical portfolio value tracking coming in a future update.
+            <b style={{ color: 'var(--text-secondary)' }}>Performance chart</b> — historical portfolio value over time is coming in a future update.
           </span>
         </div>
       </div>
@@ -2221,7 +2428,13 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
   const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [loadingData, setLoadingData] = useState(true);
   const [refreshingSignals, setRefreshingSignals] = useState(false);
-  const [signalToast, setSignalToast] = useState('');
+  const [toast, setToast] = useState('');
+  const [toastOk, setToastOk] = useState(true);
+
+  const showToast = (msg: string, ok = true) => {
+    setToast(msg); setToastOk(ok);
+    window.setTimeout(() => setToast(''), 6000);
+  };
 
   const reload = async () => {
     setLoadingData(true);
@@ -2233,50 +2446,72 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
 
   const doRefreshSignals = async () => {
     setRefreshingSignals(true);
-    setSignalToast('');
     try {
       const res = await refreshPortfolioSignals();
-      await reload();   // pull fresh enriched holdings after engine run
-      setSignalToast(`Signals updated for ${res.refreshed_count} holding${res.refreshed_count !== 1 ? 's' : ''}${res.failed_count > 0 ? ` · ${res.failed_count} failed` : ''}.`);
-      window.setTimeout(() => setSignalToast(''), 5000);
+      await reload();
+      const msg = `Live prices and scores updated for ${res.refreshed_count} holding${res.refreshed_count !== 1 ? 's' : ''}` +
+        (res.failed_count > 0 ? ` · ${res.failed_count} couldn't be fetched` : '');
+      showToast(msg, true);
     } catch (e) {
-      setSignalToast(e instanceof Error ? e.message : 'Refresh failed');
-    } finally {
-      setRefreshingSignals(false);
+      showToast(e instanceof Error ? e.message : 'Refresh failed', false);
+    } finally { setRefreshingSignals(false); }
+  };
+
+  const handleImportComplete = async (result: ImportResult) => {
+    await reload();
+    // Navigate to holdings after a fresh import; overview when first time
+    setTab(result.newHoldings.length > 0 && holdings.length === 0 ? 'overview' : 'holdings');
+    let msg = `${result.success} transaction${result.success !== 1 ? 's' : ''} saved`;
+    if (result.newHoldings.length > 0) {
+      msg += ` · ${result.newHoldings.length} new position${result.newHoldings.length !== 1 ? 's' : ''}: ${result.newHoldings.join(', ')}`;
     }
+    showToast(msg, true);
   };
 
   useEffect(() => { reload(); }, []);
 
   const TABS: Array<{ t: PortfolioTab; label: string }> = [
-    { t: 'overview', label: 'Overview' }, { t: 'holdings', label: 'Holdings' },
-    { t: 'transactions', label: 'Transactions' }, { t: 'import', label: 'Import' },
+    { t: 'overview', label: 'Overview' },
+    { t: 'holdings', label: `Holdings${holdings.filter(h => h.symbol !== 'CASH' && h.quantity > 0).length ? ` (${holdings.filter(h => h.symbol !== 'CASH' && h.quantity > 0).length})` : ''}` },
+    { t: 'transactions', label: 'Transactions' },
+    { t: 'import', label: 'Import' },
   ];
+
+  // Only show Refresh Signals when there are actual holdings to refresh
+  const hasActiveHoldings = holdings.some(h => h.symbol !== 'CASH' && h.quantity > 0);
 
   return (
     <section className="stack">
       <div className="section-head">
-        <div><h3>Portfolio OS</h3><p>Track holdings, P&L, and get KTrade recommendations for every position</p></div>
+        <div>
+          <h3>Portfolio</h3>
+          <p>Your positions, cost basis, and KTrade view — all on your Mac, all offline</p>
+        </div>
         <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center', flexWrap: 'wrap' }}>
-          {signalToast && (
-            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--green-text)' }}>{signalToast}</span>
+          {toast && (
+            <span style={{ fontSize: 'var(--text-xs)', color: toastOk ? 'var(--green-text)' : 'var(--red-text)', maxWidth: 300 }}>
+              {toastOk ? '✓ ' : '✗ '}{toast}
+            </span>
           )}
-          <button
-            className="btn btn-secondary btn-sm"
-            onClick={doRefreshSignals}
-            disabled={refreshingSignals || loadingData}
-            title="Run the KTrade engine on all your current holdings. Takes 30–90 seconds."
-          >
-            <RefreshCw size={14} className={refreshingSignals ? 'spinning' : ''} />
-            {refreshingSignals ? 'Analysing…' : 'Refresh Signals'}
-          </button>
-          <button className="btn btn-ghost btn-sm" onClick={reload}>
-            <RefreshCw size={14} className={loadingData && !refreshingSignals ? 'spinning' : ''} />Reload
+          {hasActiveHoldings && (
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={doRefreshSignals}
+              disabled={refreshingSignals || loadingData}
+              title="Fetch live prices and run the KTrade engine on your holdings (30–90 sec)"
+            >
+              <RefreshCw size={14} className={refreshingSignals ? 'spinning' : ''} />
+              {refreshingSignals ? 'Analysing holdings…' : 'Refresh Signals'}
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={reload} disabled={loadingData}>
+            <RefreshCw size={14} className={loadingData && !refreshingSignals ? 'spinning' : ''} />
+            Reload
           </button>
         </div>
       </div>
 
-      {/* Tab nav */}
+      {/* Tab navigation */}
       <div style={{ display: 'flex', gap: 4, padding: 4, background: 'var(--bg-surface-2)', borderRadius: 10, width: 'fit-content', border: '1px solid var(--border-subtle)' }}>
         {TABS.map(({ t, label }) => (
           <button key={t} onClick={() => setTab(t)} style={{
@@ -2291,15 +2526,28 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
 
       {/* Tab content */}
       {loadingData && (tab === 'overview' || tab === 'holdings') ? (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-tertiary)', padding: 40 }}>
-          <RefreshCw size={18} className="spinning" /> Loading portfolio…
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-tertiary)', padding: 48 }}>
+          <RefreshCw size={18} className="spinning" />Loading…
         </div>
       ) : (
         <>
-          {tab === 'overview'     && <PortfolioOverviewTab holdings={holdings} summary={summary} />}
-          {tab === 'holdings'     && <HoldingsTable holdings={holdings} totalValue={summary?.totalValue ?? 0} onSelectTicker={onSelectTicker} />}
+          {tab === 'overview' && (
+            <PortfolioOverviewTab
+              holdings={holdings}
+              summary={summary}
+              onGoToImport={() => setTab('import')}
+              onGoToRefresh={doRefreshSignals}
+            />
+          )}
+          {tab === 'holdings' && (
+            <HoldingsTable
+              holdings={holdings}
+              totalValue={summary?.totalValue ?? summary?.totalCost ?? 0}
+              onSelectTicker={onSelectTicker}
+            />
+          )}
           {tab === 'transactions' && <PortfolioTransactions />}
-          {tab === 'import'       && <PortfolioImportPanel onImportComplete={() => { reload(); setTab('holdings'); }} />}
+          {tab === 'import' && <PortfolioImportPanel onImportComplete={handleImportComplete} />}
         </>
       )}
     </section>
@@ -2486,7 +2734,7 @@ function App() {
           <NavButton page="ticker" current={page} setPage={setPage} icon={<Search size={16} />} label="Ticker Detail" />
           <NavButton page="research" current={page} setPage={setPage} icon={<BookOpen size={16} />} label="Research Signal" />
           {portfolioOSEnabled && (
-            <NavButton page="portfolio" current={page} setPage={setPage} icon={<Upload size={16} />} label="Portfolio OS" />
+            <NavButton page="portfolio" current={page} setPage={setPage} icon={<Briefcase size={16} />} label="Portfolio" />
           )}
           <NavButton page="history" current={page} setPage={setPage} icon={<History size={16} />} label="History" />
           <NavButton page="learningInsights" current={page} setPage={setPage} icon={<Target size={16} />} label="Learning" />
