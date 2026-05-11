@@ -36,6 +36,7 @@ from .recommendation_snapshots import (
 from .zones import cached_sr_zones, nearest_zones
 from .research import parse_research_signal
 from .pdf_statement_parser import parse_etrade_pdf
+from . import backtesting
 
 app = FastAPI(title="Ktrade Advisor")
 app.add_middleware(
@@ -113,6 +114,7 @@ def startup() -> None:
     # Initialise default settings (INSERT OR IGNORE = safe to run every time)
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('enablePortfolioOS', 'false')")
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('enableBacktestingAccuracy', 'false')")
     threading.Thread(target=safe_startup_refresh, daemon=True).start()
 
 
@@ -192,6 +194,7 @@ def dashboard() -> dict:
         "settings": {
             "show_beginner_price_help": settings.get("show_beginner_price_help", "true").lower() != "false",
             "enable_portfolio_os": settings.get("enablePortfolioOS", "false").lower() == "true",
+            "enable_backtesting_accuracy": settings.get("enableBacktestingAccuracy", "false").lower() == "true",
         },
         "cards": cards,
         "watchlists": watchlists,
@@ -351,12 +354,13 @@ def get_settings() -> dict:
     return {
         "show_beginner_price_help": rows.get("show_beginner_price_help", "true").lower() != "false",
         "enable_portfolio_os": rows.get("enablePortfolioOS", "false").lower() == "true",
+        "enable_backtesting_accuracy": rows.get("enableBacktestingAccuracy", "false").lower() == "true",
     }
 
 
 @app.patch("/api/settings/{key}")
 def update_setting(key: str, payload: SettingIn) -> dict:
-    allowed = {"show_beginner_price_help", "enablePortfolioOS"}
+    allowed = {"show_beginner_price_help", "enablePortfolioOS", "enableBacktestingAccuracy"}
     if key not in allowed:
         raise HTTPException(400, "Unknown setting")
     with db() as conn:
@@ -1117,6 +1121,96 @@ def get_portfolio_summary() -> dict:
         "topHoldings":          priced[:10],
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backtesting & Accuracy module (opt-in via enableBacktestingAccuracy)
+# All endpoints are read-only or scoped to tracked_decisions; nothing here
+# touches recommendation_snapshots or any other existing table.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TrackDecisionIn(BaseModel):
+    snapshot_id: int
+    notes: Optional[str] = None
+
+
+class CloseDecisionIn(BaseModel):
+    close_price: float
+    notes: Optional[str] = None
+
+
+@app.post("/api/backtesting/decisions")
+def api_track_decision(payload: TrackDecisionIn) -> dict:
+    """Track a recommendation snapshot as a decision the user wants to follow."""
+    try:
+        return backtesting.track_decision(payload.snapshot_id, payload.notes)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.get("/api/backtesting/decisions")
+def api_list_decisions(status: Optional[str] = None) -> list[dict]:
+    """List all tracked decisions (optionally filter by status: active|closed|archived)."""
+    return backtesting.list_decisions(status=status)
+
+
+@app.get("/api/backtesting/decisions/{decision_id}")
+def api_get_decision(decision_id: int) -> dict:
+    """Full decision detail with daily OHLC price path + signal context."""
+    detail = backtesting.get_decision_detail(decision_id)
+    if not detail:
+        raise HTTPException(404, "Decision not found")
+    return detail
+
+
+@app.post("/api/backtesting/decisions/{decision_id}/close")
+def api_close_decision(decision_id: int, payload: CloseDecisionIn) -> dict:
+    """Manually close a tracked decision (e.g. user took a different exit)."""
+    result = backtesting.close_decision_manually(
+        decision_id, payload.close_price, payload.notes
+    )
+    if not result:
+        raise HTTPException(404, "Decision not found")
+    return result
+
+
+@app.delete("/api/backtesting/decisions/{decision_id}")
+def api_untrack_decision(decision_id: int) -> dict:
+    ok = backtesting.untrack_decision(decision_id)
+    if not ok:
+        raise HTTPException(404, "Decision not found")
+    return {"ok": True}
+
+
+@app.post("/api/backtesting/evaluate-all")
+def api_evaluate_all() -> dict:
+    """Re-run the evaluator against every active decision (uses latest prices)."""
+    closed = backtesting.evaluate_all_active()
+    return {"newlyClosed": closed}
+
+
+@app.get("/api/backtesting/dashboard")
+def api_dashboard_metrics() -> dict:
+    """Hero metrics for the Backtesting & Accuracy dashboard."""
+    metrics = backtesting.get_dashboard_metrics()
+    metrics["coachInsights"] = backtesting.get_coach_insights()
+    return metrics
+
+
+@app.get("/api/backtesting/calibration")
+def api_calibration_curve() -> dict:
+    """Predicted vs realized win rate, bucketed by setup quality."""
+    return backtesting.get_calibration_curve()
+
+
+@app.get("/api/backtesting/equity-curve")
+def api_equity_curve(starting_capital: float = 1000.0) -> dict:
+    """Cumulative simulated equity if you took every tracked decision."""
+    return backtesting.get_equity_curve(starting_capital=starting_capital)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Static-file mounting (must be last)
+# ─────────────────────────────────────────────────────────────────────────────
 
 frontend_dist = ROOT / "frontend" / "dist"
 if frontend_dist.exists():

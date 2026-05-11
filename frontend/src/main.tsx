@@ -1012,6 +1012,16 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
   const [tracking, setTracking] = useState(false);
+  const [trackingForAccuracy, setTrackingForAccuracy] = useState(false);
+  const [backtestingEnabled, setBacktestingEnabled] = useState(false);
+  const [accuracyTrackedIds, setAccuracyTrackedIds] = useState<Set<number>>(new Set());
+
+  // Pull settings once so we know whether to render the "Track for accuracy" CTA
+  useEffect(() => {
+    getJson<{ enable_backtesting_accuracy: boolean }>('/api/settings')
+      .then(s => setBacktestingEnabled(Boolean(s.enable_backtesting_accuracy)))
+      .catch(() => {});
+  }, []);
 
   const load = async (target = symbol) => {
     setError('');
@@ -1023,13 +1033,43 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
       ]);
       setDetail(tickerDetail);
       setSnapshots(snapshotRows);
+
+      // Sync which snapshots are already being tracked for accuracy
+      if (backtestingEnabled) {
+        try {
+          const tracked = await listDecisions();
+          setAccuracyTrackedIds(new Set(tracked.map(d => d.snapshot_id)));
+        } catch { /* feature disabled or backend issue — silent */ }
+      }
     } catch {
       setError('Ticker not found in any watchlist. Add it first, then refresh.');
       setDetail(null); setSnapshots([]);
     }
   };
 
-  useEffect(() => { load(symbol); }, [symbol]);
+  useEffect(() => { load(symbol); }, [symbol, backtestingEnabled]);
+
+  /**
+   * Track-for-accuracy flow:
+   * 1. Make sure a fresh snapshot exists (call /api/snapshots/:ticker/track-current)
+   * 2. Fetch the latest snapshot for this ticker
+   * 3. POST to /api/backtesting/decisions with that snapshot_id
+   */
+  const trackForAccuracy = async () => {
+    if (!detail) return;
+    setTrackingForAccuracy(true); setStatus('');
+    try {
+      await sendJson(`/api/snapshots/${encodeURIComponent(detail.ticker.symbol)}/track-current`);
+      const latest = await getJson<RecommendationSnapshot[]>(`/api/snapshots/${detail.ticker.symbol}?limit=1`);
+      if (!latest.length) throw new Error('No snapshot found after tracking');
+      const newDecision = await btTrackDecision(latest[0].id);
+      setStatus(`Now tracking ${detail.ticker.symbol} for accuracy. Check the Accuracy tab to see how it plays out.`);
+      setAccuracyTrackedIds(prev => new Set(prev).add(newDecision.snapshot_id));
+      await load(detail.ticker.symbol);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to track decision');
+    } finally { setTrackingForAccuracy(false); }
+  };
 
   const score = detail?.scores?.[0];
   const indicators = detail?.indicators;
@@ -1067,6 +1107,23 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
               }}>
                 <Clock size={14} />{tracking ? 'Tracking...' : 'Track this decision'}
               </button>
+
+              {/* Track-for-Accuracy CTA — only when the Backtesting module is enabled */}
+              {backtestingEnabled && (
+                <button
+                  className="track-btn"
+                  disabled={trackingForAccuracy || !score || !indicators?.price}
+                  onClick={trackForAccuracy}
+                  style={{
+                    background: 'var(--green-muted)',
+                    border: '1px solid var(--green-dim)',
+                    color: 'var(--green-text)',
+                  }}
+                  title="Save this recommendation as a tracked decision so the Accuracy module can follow the outcome day by day."
+                >
+                  <Target size={14} />{trackingForAccuracy ? 'Adding…' : 'Track for accuracy'}
+                </button>
+              )}
             </div>
           </div>
 
@@ -2734,10 +2791,775 @@ function PortfolioOS({ onSelectTicker }: { onSelectTicker: (symbol: string) => v
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Backtesting & Accuracy module — fully self-contained
+// Renders only when settings.enable_backtesting_accuracy === true
+// ─────────────────────────────────────────────────────────────────────────────
+import type {
+  TrackedDecision,
+  DashboardMetrics as BTDashboardMetrics,
+  CalibrationCurve as BTCalibrationCurve,
+  EquityCurve as BTEquityCurve,
+  DecisionDetail as BTDecisionDetail,
+  ReliabilityBucket,
+  CloseReason,
+} from './services/backtestingService';
+import {
+  listDecisions,
+  getDecisionDetail,
+  closeDecision,
+  untrackDecision,
+  evaluateAllDecisions,
+  getDashboardMetrics as btGetDashboard,
+  getCalibrationCurve as btGetCalibration,
+  getEquityCurve as btGetEquityCurve,
+  reliabilityColors,
+  explainCloseReason,
+  formatReturnPct,
+  trackDecision as btTrackDecision,
+} from './services/backtestingService';
+import {
+  LineChart as RCLineChart,
+  Line as RCLine,
+  BarChart as RCBarChart,
+  Bar as RCBar,
+  XAxis as RCXAxis,
+  YAxis as RCYAxis,
+  CartesianGrid as RCGrid,
+  ReferenceLine as RCRefLine,
+  ReferenceArea as RCRefArea,
+  Area as RCArea,
+  AreaChart as RCAreaChart,
+  ComposedChart as RCComposedChart,
+} from 'recharts';
+
+type BacktestTab = 'dashboard' | 'decisions' | 'detail';
+
+// ── Reliability badge ─────────────────────────────────────────────────────────
+function ReliabilityBadge({ bucket, label }: { bucket: ReliabilityBucket; label?: string }) {
+  const c = reliabilityColors(bucket);
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6,
+      fontSize: 'var(--text-xs)', fontWeight: 600,
+      padding: '3px 10px', borderRadius: 999,
+      background: c.bg, border: `1px solid ${c.border}`, color: c.text,
+    }}>
+      <span>{c.emoji}</span>{label ?? c.label}
+    </span>
+  );
+}
+
+// ── Hero metric card ──────────────────────────────────────────────────────────
+function HeroMetric({
+  label, value, suffix, bucket, hint, sub,
+}: {
+  label: string; value: string; suffix?: string;
+  bucket?: ReliabilityBucket; hint?: string; sub?: string;
+}) {
+  const c = bucket ? reliabilityColors(bucket) : null;
+  return (
+    <div style={{
+      flex: '1 1 220px', minWidth: 200,
+      background: 'var(--bg-surface-2)', border: '1px solid var(--border-subtle)',
+      borderRadius: 14, padding: 'var(--space-4) var(--space-5)',
+      display: 'flex', flexDirection: 'column', gap: 8,
+    }}>
+      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
+        {label}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+        <span style={{ fontSize: 'var(--text-2xl)', fontWeight: 700, fontFamily: 'var(--font-mono)', color: c?.text ?? 'var(--text-primary)' }}>
+          {value}
+        </span>
+        {suffix && <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-tertiary)' }}>{suffix}</span>}
+      </div>
+      {sub && <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>{sub}</div>}
+      {bucket && <ReliabilityBadge bucket={bucket} />}
+      {hint && <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', lineHeight: 1.5, marginTop: 4 }}>{hint}</div>}
+    </div>
+  );
+}
+
+// ── Equity curve chart ────────────────────────────────────────────────────────
+function EquityCurveChart({ curve }: { curve: BTEquityCurve }) {
+  if (!curve.points || curve.points.length < 2) {
+    return (
+      <div style={{ padding: 'var(--space-6)', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)' }}>
+        Equity curve needs at least one closed decision to render. Close or track more decisions to see the line build.
+      </div>
+    );
+  }
+  const positive = curve.totalReturnPct >= 0;
+  const lineColor = positive ? 'var(--green-text)' : 'var(--red-text)';
+  return (
+    <div style={{ width: '100%', height: 240 }}>
+      <ResponsiveContainer>
+        <RCAreaChart data={curve.points} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
+          <defs>
+            <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={lineColor} stopOpacity={0.25} />
+              <stop offset="100%" stopColor={lineColor} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <RCGrid stroke="var(--border-subtle)" strokeDasharray="3 3" vertical={false} />
+          <RCXAxis dataKey="date" tick={{ fontSize: 11, fill: 'var(--text-tertiary)' }} />
+          <RCYAxis
+            tick={{ fontSize: 11, fill: 'var(--text-tertiary)' }}
+            tickFormatter={(v) => `$${(v as number).toFixed(0)}`}
+            domain={['auto', 'auto']}
+          />
+          <RCTooltip
+            contentStyle={{ background: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)', borderRadius: 8, fontSize: 12 }}
+            formatter={(value: any, name: string) =>
+              name === 'equity' ? [`$${Number(value).toFixed(2)}`, 'Equity'] : value
+            }
+          />
+          <RCRefLine y={curve.startingCapital} stroke="var(--text-tertiary)" strokeDasharray="4 4" />
+          <RCArea type="monotone" dataKey="equity" stroke={lineColor} fill="url(#equityFill)" strokeWidth={2} />
+        </RCAreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ── Calibration curve chart ───────────────────────────────────────────────────
+function CalibrationChart({ curve }: { curve: BTCalibrationCurve }) {
+  const data = curve.buckets.map((b) => ({
+    name: b.bucket,
+    predicted: b.predictedRate,
+    actual: b.actualRate ?? 0,
+    sampleSize: b.sampleSize,
+  }));
+  return (
+    <div style={{ width: '100%', height: 240 }}>
+      <ResponsiveContainer>
+        <RCComposedChart data={data} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
+          <RCGrid stroke="var(--border-subtle)" strokeDasharray="3 3" vertical={false} />
+          <RCXAxis dataKey="name" tick={{ fontSize: 11, fill: 'var(--text-tertiary)' }} />
+          <RCYAxis
+            tick={{ fontSize: 11, fill: 'var(--text-tertiary)' }}
+            domain={[0, 100]}
+            tickFormatter={(v) => `${v}%`}
+          />
+          <RCTooltip
+            contentStyle={{ background: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)', borderRadius: 8, fontSize: 12 }}
+            formatter={(value: any, name: any) =>
+              [`${Number(value).toFixed(1)}%`, name === 'predicted' ? 'Predicted (midpoint)' : 'Actual win rate']
+            }
+          />
+          <RCBar dataKey="predicted" fill="var(--bg-surface-3)" radius={[4, 4, 0, 0]} />
+          <RCLine type="monotone" dataKey="actual" stroke="var(--green-text)" strokeWidth={3} dot={{ r: 4 }} />
+        </RCComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ── Per-decision price-path chart ─────────────────────────────────────────────
+function DecisionPriceChart({ detail }: { detail: BTDecisionDetail }) {
+  const d = detail.decision;
+  const data = detail.price_path.map((p) => ({
+    date: p.date,
+    close: p.close,
+    high: p.high,
+    low: p.low,
+  }));
+  if (data.length === 0) {
+    return (
+      <div style={{ padding: 'var(--space-6)', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)' }}>
+        No price data yet for this ticker since the decision was tracked.
+      </div>
+    );
+  }
+
+  // Y-axis range that contains all interesting levels
+  const allPrices = [
+    ...data.flatMap((p) => [p.close, p.high, p.low].filter((v): v is number => v != null)),
+    d.entry_price,
+    d.buy_zone_low ?? d.entry_price,
+    d.buy_zone_high ?? d.entry_price,
+    d.risk_line ?? d.entry_price,
+    d.review_target1 ?? d.entry_price,
+    d.review_target2 ?? d.entry_price,
+  ];
+  const minY = Math.min(...allPrices) * 0.98;
+  const maxY = Math.max(...allPrices) * 1.02;
+
+  return (
+    <div style={{ width: '100%', height: 360 }}>
+      <ResponsiveContainer>
+        <RCComposedChart data={data} margin={{ top: 10, right: 24, left: 0, bottom: 0 }}>
+          <RCGrid stroke="var(--border-subtle)" strokeDasharray="3 3" vertical={false} />
+          <RCXAxis dataKey="date" tick={{ fontSize: 11, fill: 'var(--text-tertiary)' }} />
+          <RCYAxis
+            tick={{ fontSize: 11, fill: 'var(--text-tertiary)' }}
+            domain={[minY, maxY]}
+            tickFormatter={(v) => `$${(v as number).toFixed(2)}`}
+            width={70}
+          />
+          <RCTooltip
+            contentStyle={{ background: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)', borderRadius: 8, fontSize: 12 }}
+            formatter={(value: any) => `$${Number(value).toFixed(2)}`}
+          />
+
+          {/* Buy zone overlay */}
+          {d.buy_zone_low != null && d.buy_zone_high != null && (
+            <RCRefArea y1={d.buy_zone_low} y2={d.buy_zone_high} fill="var(--green-text)" fillOpacity={0.08} />
+          )}
+
+          {/* Reference lines: entry, target1, target2, risk */}
+          <RCRefLine y={d.entry_price} stroke="var(--text-secondary)" strokeDasharray="4 4" label={{ value: 'Entry', fill: 'var(--text-secondary)', fontSize: 10, position: 'right' }} />
+          {d.review_target1 != null && (
+            <RCRefLine y={d.review_target1} stroke="var(--green-text)" strokeDasharray="3 3" label={{ value: 'Target 1', fill: 'var(--green-text)', fontSize: 10, position: 'right' }} />
+          )}
+          {d.review_target2 != null && (
+            <RCRefLine y={d.review_target2} stroke="var(--green-text)" strokeDasharray="3 3" label={{ value: 'Target 2', fill: 'var(--green-text)', fontSize: 10, position: 'right' }} />
+          )}
+          {d.risk_line != null && (
+            <RCRefLine y={d.risk_line} stroke="var(--red-text)" strokeDasharray="3 3" label={{ value: 'Risk line', fill: 'var(--red-text)', fontSize: 10, position: 'right' }} />
+          )}
+
+          <RCLine type="monotone" dataKey="close" stroke="var(--blue-text)" strokeWidth={2} dot={false} />
+        </RCComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ── Decisions list card ───────────────────────────────────────────────────────
+function DecisionListCard({
+  decision, onOpen,
+}: {
+  decision: TrackedDecision; onOpen: () => void;
+}) {
+  const isActive = decision.status === 'active';
+  const realized = decision.realized_return_pct;
+  const current  = decision.current_return_pct;
+  const ret = isActive ? current : realized;
+  const retFmt = formatReturnPct(ret);
+
+  // Determine state color
+  let stateColor = 'var(--text-tertiary)';
+  let stateLabel = 'Active';
+  let stateBg = 'var(--bg-surface-3)';
+  if (decision.status === 'closed') {
+    if (decision.close_reason === 'target1_hit' || decision.close_reason === 'target2_hit') {
+      stateColor = 'var(--green-text)'; stateLabel = 'Target hit'; stateBg = 'var(--green-muted)';
+    } else if (decision.close_reason === 'risk_breached') {
+      stateColor = 'var(--red-text)';   stateLabel = 'Risk hit';   stateBg = 'var(--red-muted)';
+    } else {
+      stateColor = 'var(--text-secondary)'; stateLabel = 'Closed'; stateBg = 'var(--bg-surface-3)';
+    }
+  } else {
+    if (decision.buy_zone_hit_date) {
+      stateColor = 'var(--blue-text)'; stateLabel = 'In zone'; stateBg = 'var(--bg-surface-3)';
+    }
+  }
+
+  return (
+    <button
+      onClick={onOpen}
+      style={{
+        display: 'block', width: '100%', textAlign: 'left',
+        background: 'var(--bg-surface-2)', border: '1px solid var(--border-subtle)',
+        borderRadius: 12, padding: 'var(--space-4)', cursor: 'pointer',
+        transition: 'transform 0.1s, border-color 0.1s',
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--border-default)'; }}
+      onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 'var(--space-2)' }}>
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 'var(--text-md)', fontWeight: 700 }}>{decision.ticker}</span>
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
+              Score {decision.setup_quality}/100
+            </span>
+          </div>
+          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 2 }}>
+            Tracked {decision.tracked_at.slice(0, 10)} · {decision.days_since_tracked}d ago
+          </div>
+        </div>
+        <span style={{
+          fontSize: 'var(--text-xs)', fontWeight: 600,
+          padding: '3px 10px', borderRadius: 999,
+          background: stateBg, color: stateColor, border: `1px solid ${stateColor}40`,
+        }}>{stateLabel}</span>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 16 }}>
+        <div style={{ fontSize: 'var(--text-xl)', fontWeight: 700, fontFamily: 'var(--font-mono)',
+                      color: retFmt.positive ? 'var(--green-text)' : (ret != null && ret < 0 ? 'var(--red-text)' : 'var(--text-secondary)') }}>
+          {retFmt.text}
+        </div>
+        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
+          Entry ${decision.entry_price.toFixed(2)}
+          {decision.latest_close != null && ` → $${decision.latest_close.toFixed(2)}`}
+        </div>
+      </div>
+
+      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', marginTop: 'var(--space-2)', lineHeight: 1.5 }}>
+        {explainCloseReason(decision.close_reason)}
+      </div>
+    </button>
+  );
+}
+
+// ── Decision detail view ──────────────────────────────────────────────────────
+function BacktestDecisionDetail({
+  decisionId, onBack, onChange,
+}: {
+  decisionId: number; onBack: () => void; onChange: () => void;
+}) {
+  const [detail, setDetail] = useState<BTDecisionDetail | null>(null);
+  const [error, setError] = useState('');
+  const [working, setWorking] = useState(false);
+  const [showCloseForm, setShowCloseForm] = useState(false);
+  const [closePriceStr, setClosePriceStr] = useState('');
+  const [notes, setNotes] = useState('');
+
+  const load = async () => {
+    try {
+      setDetail(await getDecisionDetail(decisionId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load decision');
+    }
+  };
+  useEffect(() => { load(); }, [decisionId]);
+
+  if (error) return <div className="alert"><ShieldAlert size={16} />{error}</div>;
+  if (!detail) {
+    return <div style={{ padding: 'var(--space-6)', color: 'var(--text-tertiary)' }}><RefreshCw className="spinning" size={16} /> Loading…</div>;
+  }
+
+  const d = detail.decision;
+  const sig = (detail.snapshot_context?.signal_summary ?? {}) as Record<string, any>;
+
+  const doClose = async () => {
+    const price = parseFloat(closePriceStr);
+    if (Number.isNaN(price)) return;
+    setWorking(true);
+    try {
+      await closeDecision(decisionId, price, notes || undefined);
+      await load();
+      setShowCloseForm(false);
+      onChange();
+    } finally { setWorking(false); }
+  };
+
+  const doUntrack = async () => {
+    if (!confirm(`Stop tracking ${d.ticker}? This won't affect your snapshot history.`)) return;
+    setWorking(true);
+    try {
+      await untrackDecision(decisionId);
+      onChange();
+      onBack();
+    } finally { setWorking(false); }
+  };
+
+  const retFmt = formatReturnPct(d.status === 'active' ? d.current_return_pct : d.realized_return_pct);
+
+  return (
+    <div className="stack" style={{ gap: 'var(--space-4)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back to all decisions</button>
+        {d.status === 'active' && (
+          <>
+            <button className="btn btn-secondary btn-sm" onClick={() => setShowCloseForm(s => !s)}>Close manually</button>
+          </>
+        )}
+        <button className="btn btn-ghost btn-sm" onClick={doUntrack} style={{ marginLeft: 'auto', color: 'var(--text-tertiary)' }}>
+          <Trash2 size={14} /> Stop tracking
+        </button>
+      </div>
+
+      {/* Hero */}
+      <div className="panel">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-4)' }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-2xl)', fontWeight: 700 }}>{d.ticker}</div>
+            <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', marginTop: 4 }}>
+              {d.recommended_action} · Setup quality <b>{d.setup_quality}/100</b>
+            </div>
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 8 }}>
+              Tracked {d.tracked_at.slice(0, 10)} ({d.days_since_tracked} days ago)
+            </div>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: 'var(--text-2xl)', fontWeight: 700, fontFamily: 'var(--font-mono)',
+                          color: retFmt.positive ? 'var(--green-text)' : (retFmt.text !== '—' ? 'var(--red-text)' : 'var(--text-secondary)') }}>
+              {retFmt.text}
+            </div>
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
+              Entry ${d.entry_price.toFixed(2)}
+              {d.latest_close != null && ` → $${d.latest_close.toFixed(2)}`}
+            </div>
+            <div style={{ marginTop: 8, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+              {explainCloseReason(d.close_reason)}
+            </div>
+          </div>
+        </div>
+
+        {showCloseForm && (
+          <div style={{ marginTop: 'var(--space-4)', padding: 'var(--space-4)', background: 'var(--bg-surface-3)', borderRadius: 10 }}>
+            <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600, marginBottom: 'var(--space-2)' }}>Close at price</div>
+            <div className="form-row">
+              <input
+                placeholder="e.g. 145.30"
+                value={closePriceStr}
+                onChange={(e) => setClosePriceStr(e.target.value)}
+                style={{ maxWidth: 140 }}
+              />
+              <input
+                placeholder="Notes (optional)"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+              />
+              <button className="btn btn-primary btn-sm" onClick={doClose} disabled={working || !closePriceStr}>
+                {working ? 'Saving…' : 'Close decision'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Price path chart */}
+      <div className="panel">
+        <h3 style={{ marginTop: 0 }}>Price path since you tracked it</h3>
+        <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-3)' }}>
+          Buy zone is shaded green. Targets and risk line shown as dashed reference lines.
+        </p>
+        <DecisionPriceChart detail={detail} />
+      </div>
+
+      {/* Event timeline */}
+      <div className="panel">
+        <h3 style={{ marginTop: 0 }}>What's happened so far</h3>
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', lineHeight: 1.9 }}>
+          <li>Tracked at <b>${d.entry_price.toFixed(2)}</b> on {d.tracked_at.slice(0, 10)}</li>
+          {d.buy_zone_hit_date && <li>✓ Reached the buy zone on <b>{d.buy_zone_hit_date}</b></li>}
+          {!d.buy_zone_hit_date && d.buy_zone_low != null && <li>Buy zone (${d.buy_zone_low.toFixed(2)}–${d.buy_zone_high?.toFixed(2)}) not reached yet</li>}
+          {d.target1_hit_date && <li style={{ color: 'var(--green-text)' }}>✓ Hit Target 1 (${d.review_target1?.toFixed(2)}) on <b>{d.target1_hit_date}</b></li>}
+          {d.target2_hit_date && <li style={{ color: 'var(--green-text)' }}>✓ Hit Target 2 (${d.review_target2?.toFixed(2)}) on <b>{d.target2_hit_date}</b></li>}
+          {d.risk_breached_date && <li style={{ color: 'var(--red-text)' }}>⚠ Crossed below risk line (${d.risk_line?.toFixed(2)}) on <b>{d.risk_breached_date}</b></li>}
+          {d.max_high_to_date != null && <li>Highest since tracking: ${d.max_high_to_date.toFixed(2)}</li>}
+          {d.min_low_to_date != null && <li>Lowest since tracking: ${d.min_low_to_date.toFixed(2)}</li>}
+        </ul>
+      </div>
+
+      {/* Signal context */}
+      {Object.keys(sig).length > 0 && (
+        <div className="panel">
+          <h3 style={{ marginTop: 0 }}>Why we recommended this</h3>
+          <div className="detail-stat-grid">
+            {sig.trend       && <DetailStat label="Trend"      value={String(sig.trend)} />}
+            {sig.momentum    && <DetailStat label="Momentum"   value={String(sig.momentum)} />}
+            {sig.volume      && <DetailStat label="Volume"     value={String(sig.volume)} />}
+            {sig.risk        && <DetailStat label="Risk level" value={String(sig.risk)} />}
+            {sig.rsi != null && <DetailStat label="RSI"        value={String(sig.rsi)} />}
+            {sig.adx != null && <DetailStat label="ADX"        value={String(sig.adx)} />}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Backtesting Dashboard view ────────────────────────────────────────────────
+function BacktestingDashboardView({
+  metrics, calibration, equity, onGotoDecisions,
+}: {
+  metrics: BTDashboardMetrics; calibration: BTCalibrationCurve; equity: BTEquityCurve;
+  onGotoDecisions: () => void;
+}) {
+  if (metrics.totalTracked === 0) {
+    return (
+      <div style={{ padding: 'var(--space-10) var(--space-6)', textAlign: 'center', maxWidth: 540, margin: '0 auto' }}>
+        <div style={{ width: 72, height: 72, margin: '0 auto var(--space-4)', borderRadius: '50%', background: 'var(--bg-surface-3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Target size={32} style={{ color: 'var(--blue-text)' }} />
+        </div>
+        <h2 style={{ fontSize: 'var(--text-xl)', marginBottom: 8 }}>Start building your accuracy history</h2>
+        <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+          When you find a recommendation you want to follow, click <b>"Track for accuracy"</b> on its ticker card.
+          We'll watch the price every day and tell you exactly how the call played out — buy zone hit, target reached,
+          risk line breached, or still active.
+        </p>
+        <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-5)', lineHeight: 1.7 }}>
+          After about 5 closed decisions you'll unlock reliability scores and a calibration curve. Until then,
+          we'll show your progress with calm "early data" markers — no judgment, just learning.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="stack" style={{ gap: 'var(--space-5)' }}>
+      {/* Hero metrics */}
+      <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
+        <HeroMetric
+          label="How often we were right"
+          value={metrics.hitRate != null ? `${metrics.hitRate.toFixed(0)}` : '—'}
+          suffix={metrics.hitRate != null ? '%' : ''}
+          bucket={metrics.hitRateReliability}
+          sub={`Targets hit ${metrics.targetHits} · Risk-stops ${metrics.riskBreaches}`}
+          hint="When a target or risk fired, how often the target won."
+        />
+        <HeroMetric
+          label="Buy zones reached"
+          value={metrics.buyZoneHitRate != null ? `${metrics.buyZoneHitRate.toFixed(0)}` : '—'}
+          suffix={metrics.buyZoneHitRate != null ? '%' : ''}
+          bucket={metrics.buyZoneReliability}
+          sub={`Across ${metrics.totalTracked} tracked decision${metrics.totalTracked !== 1 ? 's' : ''}`}
+          hint="How often the engine's preferred entry got tested."
+        />
+        <HeroMetric
+          label="Win rate"
+          value={metrics.winRate != null ? `${metrics.winRate.toFixed(0)}` : '—'}
+          suffix={metrics.winRate != null ? '%' : ''}
+          bucket={metrics.winRateReliability}
+          sub={`${metrics.closed} closed · avg ${formatReturnPct(metrics.avgReturn).text}`}
+          hint="Closed decisions that ended in positive return."
+        />
+        <HeroMetric
+          label="Reward-to-risk"
+          value={metrics.realizedRR != null ? `${metrics.realizedRR.toFixed(2)}×` : '—'}
+          sub={`Avg win ${formatReturnPct(metrics.avgWin).text} · avg loss ${formatReturnPct(metrics.avgLoss).text}`}
+          hint="Each $1 of loss earned this much in winners."
+        />
+        <HeroMetric
+          label="Expectancy per decision"
+          value={metrics.expectancy != null ? `${metrics.expectancy >= 0 ? '+' : ''}${metrics.expectancy.toFixed(2)}` : '—'}
+          suffix={metrics.expectancy != null ? '%' : ''}
+          sub="Expected return if you took every signal"
+          hint="Win rate × avg win − loss rate × avg loss."
+        />
+      </div>
+
+      {/* Coach insights */}
+      {metrics.coachInsights.length > 0 && (
+        <div className="panel" style={{ background: 'var(--bg-surface-2)' }}>
+          <h3 style={{ marginTop: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Activity size={18} style={{ color: 'var(--blue-text)' }} /> What this means for you
+          </h3>
+          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', lineHeight: 1.9 }}>
+            {metrics.coachInsights.map((line, i) => <li key={i}>{line}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {/* Charts row */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 'var(--space-4)' }}>
+        <div className="panel">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+            <h3 style={{ margin: 0 }}>Simulated equity curve</h3>
+            <ReliabilityBadge bucket={equity.tradeCount && equity.tradeCount >= 5 ? (equity.totalReturnPct > 0 ? 'green' : 'orange') : 'blue'} />
+          </div>
+          <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-2)' }}>
+            What ${equity.startingCapital.toFixed(0)} would look like if you took every tracked decision equally.
+            Currently ${equity.finalEquity.toFixed(2)} ({formatReturnPct(equity.totalReturnPct).text}).
+          </p>
+          <EquityCurveChart curve={equity} />
+        </div>
+
+        <div className="panel">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+            <h3 style={{ margin: 0 }}>Calibration — do scores predict reality?</h3>
+            {calibration.calibrationScore != null && (
+              <ReliabilityBadge bucket={calibration.reliability} label={`Trust score ${calibration.calibrationScore.toFixed(0)}`} />
+            )}
+          </div>
+          <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-2)' }}>
+            Each bar shows the predicted (midpoint of bucket) and the actual realized win rate. Closer = better calibrated.
+          </p>
+          <CalibrationChart curve={calibration} />
+        </div>
+      </div>
+
+      {/* Per-ticker leaderboard */}
+      {metrics.perTicker.length > 0 && (
+        <div className="panel">
+          <h3 style={{ marginTop: 0 }}>Per-ticker accuracy</h3>
+          <div className="table-panel">
+            <table>
+              <thead><tr><th>Ticker</th><th>Closed</th><th>Win rate</th><th>Avg return</th><th>Reliability</th></tr></thead>
+              <tbody>
+                {metrics.perTicker.map((row) => (
+                  <tr key={row.ticker}>
+                    <td><b>{row.ticker}</b></td>
+                    <td style={{ fontFamily: 'var(--font-mono)' }}>{row.closed}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)' }}>{row.winRate.toFixed(0)}%</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', color: row.avgReturn >= 0 ? 'var(--green-text)' : 'var(--red-text)' }}>
+                      {formatReturnPct(row.avgReturn).text}
+                    </td>
+                    <td><ReliabilityBadge bucket={row.reliability} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', justifyContent: 'center' }}>
+        <button className="btn btn-secondary" onClick={onGotoDecisions}>
+          <Target size={14} /> Browse all {metrics.totalTracked} decision{metrics.totalTracked !== 1 ? 's' : ''}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Decisions list view ───────────────────────────────────────────────────────
+function BacktestDecisionsList({
+  decisions, onOpen, onRefresh,
+}: {
+  decisions: TrackedDecision[]; onOpen: (id: number) => void; onRefresh: () => void;
+}) {
+  const [filter, setFilter] = useState<'all' | 'active' | 'closed'>('all');
+  const filtered = filter === 'all' ? decisions : decisions.filter(d => d.status === filter);
+
+  const counts = {
+    all:    decisions.length,
+    active: decisions.filter(d => d.status === 'active').length,
+    closed: decisions.filter(d => d.status === 'closed').length,
+  };
+
+  if (decisions.length === 0) {
+    return (
+      <div style={{ padding: 'var(--space-10) var(--space-6)', textAlign: 'center', color: 'var(--text-tertiary)' }}>
+        No tracked decisions yet. Track one from any ticker detail page to see it here.
+      </div>
+    );
+  }
+
+  return (
+    <div className="stack" style={{ gap: 'var(--space-4)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
+        <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+          {(['all', 'active', 'closed'] as const).map(f => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`btn btn-sm ${filter === f ? 'btn-primary' : 'btn-ghost'}`}
+            >
+              {f.charAt(0).toUpperCase() + f.slice(1)} ({counts[f]})
+            </button>
+          ))}
+        </div>
+        <button className="btn btn-secondary btn-sm" onClick={onRefresh}>
+          <RefreshCw size={14} /> Re-evaluate
+        </button>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 'var(--space-3)' }}>
+        {filtered.map(d => (
+          <DecisionListCard key={d.id} decision={d} onOpen={() => onOpen(d.id)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Backtesting tab root ──────────────────────────────────────────────────────
+function BacktestingView() {
+  const [tab, setTab] = useState<BacktestTab>('dashboard');
+  const [decisions, setDecisions] = useState<TrackedDecision[]>([]);
+  const [metrics, setMetrics] = useState<BTDashboardMetrics | null>(null);
+  const [calibration, setCalibration] = useState<BTCalibrationCurve | null>(null);
+  const [equity, setEquity] = useState<BTEquityCurve | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  const load = async () => {
+    setError('');
+    try {
+      const [decs, m, c, e] = await Promise.all([
+        listDecisions(),
+        btGetDashboard(),
+        btGetCalibration(),
+        btGetEquityCurve(),
+      ]);
+      setDecisions(decs); setMetrics(m); setCalibration(c); setEquity(e);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load backtesting data');
+    } finally { setLoading(false); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const doReevaluate = async () => {
+    setLoading(true);
+    try { await evaluateAllDecisions(); await load(); } finally { setLoading(false); }
+  };
+
+  const TABS: Array<{ t: BacktestTab; label: string }> = [
+    { t: 'dashboard', label: 'Accuracy Dashboard' },
+    { t: 'decisions', label: `All decisions${decisions.length ? ` (${decisions.length})` : ''}` },
+  ];
+
+  return (
+    <section className="stack">
+      <div className="section-head">
+        <div>
+          <h3>Backtesting &amp; Accuracy</h3>
+          <p>Track decisions over time. Learn what works. Build trust in the engine — or correct it.</p>
+        </div>
+      </div>
+
+      {/* Sub-tabs (hidden when on decision detail) */}
+      {tab !== 'detail' && (
+        <div style={{ display: 'flex', gap: 'var(--space-1)', borderBottom: '1px solid var(--border-subtle)' }}>
+          {TABS.map(({ t, label }) => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                padding: 'var(--space-3) var(--space-4)',
+                fontSize: 'var(--text-sm)', fontWeight: tab === t ? 600 : 500,
+                color: tab === t ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                borderBottom: tab === t ? '2px solid var(--blue-text)' : '2px solid transparent',
+                marginBottom: -1,
+              }}
+            >{label}</button>
+          ))}
+        </div>
+      )}
+
+      {error && <div className="alert"><ShieldAlert size={16} />{error}</div>}
+      {loading && <div style={{ padding: 'var(--space-6)', color: 'var(--text-tertiary)' }}><RefreshCw size={14} className="spinning" /> Loading…</div>}
+
+      {!loading && tab === 'dashboard' && metrics && calibration && equity && (
+        <BacktestingDashboardView
+          metrics={metrics}
+          calibration={calibration}
+          equity={equity}
+          onGotoDecisions={() => setTab('decisions')}
+        />
+      )}
+      {!loading && tab === 'decisions' && (
+        <BacktestDecisionsList
+          decisions={decisions}
+          onOpen={(id) => { setSelectedId(id); setTab('detail'); }}
+          onRefresh={doReevaluate}
+        />
+      )}
+      {!loading && tab === 'detail' && selectedId != null && (
+        <BacktestDecisionDetail
+          decisionId={selectedId}
+          onBack={() => setTab('decisions')}
+          onChange={load}
+        />
+      )}
+    </section>
+  );
+}
+
 // ── SettingsView ──────────────────────────────────────────────────────────────
 function SettingsView() {
   const [positions, setPositions] = useState<any>(null);
-  const [settings, setSettings] = useState<{ show_beginner_price_help: boolean; enable_portfolio_os: boolean } | null>(null);
+  const [settings, setSettings] = useState<{ show_beginner_price_help: boolean; enable_portfolio_os: boolean; enable_backtesting_accuracy: boolean } | null>(null);
   const [form, setForm] = useState({ ticker: '', shares: '', cost: '', theme: '' });
 
   const load = async () => {
@@ -2778,7 +3600,7 @@ function SettingsView() {
           </label>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'var(--space-3)', padding: 'var(--space-3) 0' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'var(--space-3)', padding: 'var(--space-3) 0', borderBottom: '1px solid var(--border-subtle)' }}>
           <div>
             <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600, marginBottom: 4 }}>Enable Portfolio Operating System</div>
             <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
@@ -2794,7 +3616,29 @@ function SettingsView() {
                 const next = e.target.checked;
                 setSettings(s => s ? { ...s, enable_portfolio_os: next } : s);
                 await sendJson('/api/settings/enablePortfolioOS', { value: String(next) }, 'PATCH');
-                // Reload the page so the nav tab appears/disappears immediately
+                window.location.reload();
+              }}
+            />
+          </label>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 'var(--space-3)', padding: 'var(--space-3) 0' }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600, marginBottom: 4 }}>Enable Backtesting &amp; Accuracy Module</div>
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+              Unlock a separate tab where you can mark any recommendation as "Track this Decision" and watch how the
+              call plays out. Includes hit-rate, calibration curve, simulated equity curve, and per-decision charts.
+              100% read-only — your existing ticker cards and history are unaffected. Off by default.
+            </div>
+          </div>
+          <label className="toggle setting-toggle">
+            <input
+              type="checkbox"
+              checked={Boolean(settings?.enable_backtesting_accuracy)}
+              onChange={async (e) => {
+                const next = e.target.checked;
+                setSettings(s => s ? { ...s, enable_backtesting_accuracy: next } : s);
+                await sendJson('/api/settings/enableBacktestingAccuracy', { value: String(next) }, 'PATCH');
                 window.location.reload();
               }}
             />
@@ -2890,6 +3734,7 @@ function App() {
   const cards = dashboard?.cards ?? [];
   const showHelp = dashboard?.settings?.show_beginner_price_help ?? true;
   const portfolioOSEnabled = dashboard?.settings?.enable_portfolio_os ?? false;
+  const backtestingEnabled = (dashboard?.settings as any)?.enable_backtesting_accuracy ?? false;
 
   // Market label → regime class
   const marketLabel = (dashboard?.market.label || '').toLowerCase();
@@ -2915,6 +3760,9 @@ function App() {
           <NavButton page="research" current={page} setPage={setPage} icon={<BookOpen size={16} />} label="Research Signal" />
           {portfolioOSEnabled && (
             <NavButton page="portfolio" current={page} setPage={setPage} icon={<Briefcase size={16} />} label="Portfolio" />
+          )}
+          {backtestingEnabled && (
+            <NavButton page="backtesting" current={page} setPage={setPage} icon={<Target size={16} />} label="Accuracy" />
           )}
           <NavButton page="history" current={page} setPage={setPage} icon={<History size={16} />} label="History" />
           <NavButton page="learningInsights" current={page} setPage={setPage} icon={<Target size={16} />} label="Learning" />
@@ -2969,6 +3817,7 @@ function App() {
           {page === 'ticker' && <TickerView symbol={selectedTicker} setSymbol={setSelectedTicker} />}
           {page === 'research' && <ResearchView />}
           {page === 'portfolio' && portfolioOSEnabled && <PortfolioOS onSelectTicker={goToTicker} />}
+          {page === 'backtesting' && backtestingEnabled && <BacktestingView />}
           {page === 'history' && <HistoryView />}
           {page === 'learningInsights' && <LearningInsightsView />}
           {page === 'settings' && <SettingsView />}

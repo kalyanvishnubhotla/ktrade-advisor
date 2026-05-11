@@ -301,6 +301,73 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS portfolio_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                broker TEXT NOT NULL,
+                file_name TEXT,
+                import_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                transaction_date DATE,
+                symbol TEXT,
+                type TEXT,
+                quantity REAL,
+                price REAL,
+                amount REAL,
+                raw_data JSON,
+                notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS portfolio_holdings (
+                symbol TEXT PRIMARY KEY,
+                quantity REAL NOT NULL DEFAULT 0,
+                avg_cost_basis REAL,
+                total_cost REAL,
+                last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sources TEXT,
+                last_transaction_date DATE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_portfolio_tx_symbol ON portfolio_transactions(symbol);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_tx_date ON portfolio_transactions(transaction_date);
+
+            -- ── Backtesting & Accuracy module ─────────────────────────────────
+            -- tracked_decisions: created when the user clicks "Track this Decision"
+            -- on a recommendation card. References a recommendation_snapshots row
+            -- (no schema change to the existing table). Status reflects evaluator
+            -- output: active until target/risk fires, then closed.
+            CREATE TABLE IF NOT EXISTS tracked_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL REFERENCES recommendation_snapshots(id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                tracked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                entry_price REAL NOT NULL,           -- price at the moment of tracking
+                buy_zone_low REAL,                    -- denormalised from snapshot for fast query
+                buy_zone_high REAL,
+                risk_line REAL,
+                review_target1 REAL,
+                review_target2 REAL,
+                setup_quality INTEGER NOT NULL,
+                recommended_action TEXT,
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'closed', 'archived')),
+                close_reason TEXT
+                    CHECK(close_reason IN (
+                        'target1_hit', 'target2_hit',
+                        'risk_breached', 'manual_close', 'expired'
+                    ) OR close_reason IS NULL),
+                close_price REAL,
+                closed_at DATETIME,
+                realized_return_pct REAL,
+                hold_days INTEGER,
+                notes TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tracked_decisions_status
+                ON tracked_decisions(status, tracked_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tracked_decisions_ticker
+                ON tracked_decisions(ticker, tracked_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tracked_decisions_snapshot
+                ON tracked_decisions(snapshot_id);
             """
         )
         indicator_existing = [row["name"] for row in conn.execute("PRAGMA table_info(indicators)").fetchall()]
@@ -331,6 +398,12 @@ def init_db() -> None:
             ("bb_upper", "REAL"),
             ("bb_lower", "REAL"),
             ("bb_width_pct", "REAL"),
+            # Week 3-4 signal columns (JSON blobs)
+            ("earnings_signal_json", "TEXT"),
+            ("sector_rs_signal_json", "TEXT"),
+            ("regime_signal_json", "TEXT"),
+            ("insider_signal_json", "TEXT"),
+            ("fundamentals_signal_json", "TEXT"),
         ]:
             if column not in indicator_existing:
                 conn.execute(f"ALTER TABLE indicators ADD COLUMN {column} {definition}")
