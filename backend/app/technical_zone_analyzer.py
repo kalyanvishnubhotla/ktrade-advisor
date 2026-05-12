@@ -7,9 +7,21 @@ import pandas as pd
 import yfinance as yf
 
 from .analysis import compute_indicators, score_ticker
+from .earnings_intelligence import analyze_earnings, fetch_eps_surprise_avg
 from .fibonacci import FibSetup, FibZone, calculate_fib_extensions, calculate_recent_fib_zones
+from .fundamentals import analyze_fundamentals
+from .insider_transactions import analyze_insider_activity, fetch_insider_transactions
 from .momentum import analyze_momentum
 from .pivots import Pivot, detect_multi_timeframe_pivots, major_swings, nearest_support_resistance
+from .sector_relative_strength import analyze_sector_rs
+from .yfinance_cache import (
+    yf_cached_calendar,
+    yf_cached_earnings_dates,
+    yf_cached_eps_surprise,
+    yf_cached_history,
+    yf_cached_info,
+    yf_cached_insider,
+)
 from .zones import SRZone, calculate_sr_zones, recommendation_zones
 
 
@@ -35,33 +47,59 @@ class TechnicalZoneAnalyzer:
     def __init__(self, period: str = "2y") -> None:
         self.period = period
 
-    def fetch_latest_data(self, symbol: str) -> tuple[pd.DataFrame, dict]:
-        ticker = yf.Ticker(symbol)
-        history = ticker.history(period=self.period, auto_adjust=False)
-        info = {}
-        try:
-            raw_info = ticker.get_info()
-            info = {
-                "company": raw_info.get("shortName") or raw_info.get("longName"),
-                "asset_type": "etf" if raw_info.get("quoteType") == "ETF" else "stock",
-            }
-            earnings_date = self.next_earnings_date(ticker)
-            if earnings_date:
-                info["earnings_date"] = earnings_date
-        except Exception:
-            info = {}
-        return history, info
+    # ── Public fetchers ──────────────────────────────────────────────────────
+    # Each piece is now cached via yfinance_cache.py and can be called
+    # independently. market_data.py composes these in parallel.
 
-    def next_earnings_date(self, ticker: yf.Ticker) -> str | None:
+    def fetch_history(self, symbol: str) -> pd.DataFrame | None:
+        """Just the OHLCV DataFrame. Cached for 5 min."""
+        return yf_cached_history(symbol, period=self.period)
+
+    def fetch_info_bundle(self, symbol: str) -> dict:
+        """
+        Every "info"-style field we need for analysis in one trip.
+
+        Each piece is cached at its own TTL (info: 24h, insider: 24h, eps: 7d).
+        So a "miss" only fetches the parts that have actually expired — usually
+        zero on subsequent refreshes within the same day.
+        """
+        info: dict = {}
+        raw_info = yf_cached_info(symbol)
+        if raw_info:
+            asset_type = "etf" if raw_info.get("quoteType") == "ETF" else "stock"
+            info["company"]    = raw_info.get("shortName") or raw_info.get("longName")
+            info["asset_type"] = asset_type
+            info["sector"]     = raw_info.get("sector")
+            info["_raw_info"]  = raw_info
+
+        earnings_date = self._earliest_future_earnings(symbol)
+        if earnings_date:
+            info["earnings_date"] = earnings_date
+
+        info["eps_surprise_avg"] = yf_cached_eps_surprise(symbol)
+        info["_insider_df"]      = yf_cached_insider(symbol)
+        return info
+
+    def fetch_latest_data(self, symbol: str) -> tuple[pd.DataFrame, dict]:
+        """Convenience wrapper kept for compatibility with the old callsites."""
+        history = self.fetch_history(symbol)
+        if history is None or history.empty:
+            return pd.DataFrame(), {}
+        return history, self.fetch_info_bundle(symbol)
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _earliest_future_earnings(self, symbol: str) -> str | None:
+        """Cached earnings-date resolution — merges get_earnings_dates + calendar."""
         candidates: list[pd.Timestamp] = []
+        dates = yf_cached_earnings_dates(symbol)
         try:
-            dates = ticker.get_earnings_dates(limit=4)
-            if dates is not None and not dates.empty:
-                candidates.extend(pd.Timestamp(index_value) for index_value in dates.index)
+            if dates is not None and hasattr(dates, "empty") and not dates.empty:
+                candidates.extend(pd.Timestamp(idx) for idx in dates.index)
         except Exception:
             pass
+        calendar = yf_cached_calendar(symbol)
         try:
-            calendar = ticker.calendar
             if isinstance(calendar, dict):
                 for value in calendar.values():
                     if isinstance(value, (list, tuple)):
@@ -80,9 +118,17 @@ class TechnicalZoneAnalyzer:
             else:
                 candidate = candidate.tz_convert("UTC")
             normalized.append(candidate)
-        future = sorted([candidate for candidate in normalized if candidate >= now])
+        future = sorted([c for c in normalized if c >= now])
         chosen = future[0] if future else max(normalized)
         return chosen.date().isoformat()
+
+    # Back-compat shim — older code may import this method name
+    def next_earnings_date(self, ticker_or_symbol) -> str | None:
+        if isinstance(ticker_or_symbol, str):
+            return self._earliest_future_earnings(ticker_or_symbol)
+        # Was previously called with a yf.Ticker — extract its symbol attribute
+        symbol = getattr(ticker_or_symbol, "ticker", None) or getattr(ticker_or_symbol, "symbol", None)
+        return self._earliest_future_earnings(symbol) if symbol else None
 
     def analyze(
         self,
@@ -90,10 +136,18 @@ class TechnicalZoneAnalyzer:
         history: pd.DataFrame | None = None,
         spy_history: pd.DataFrame | None = None,
         research_signals: list[dict] | None = None,
+        regime_data: dict | None = None,
+        sector_etf_history: pd.DataFrame | None = None,
+        info: dict | None = None,   # NEW: pre-fetched info bundle (avoids duplicate yfinance calls)
     ) -> TechnicalZoneAnalysis:
+        # Callers (notably market_data.refresh_all) now pre-fetch history+info
+        # in parallel and pass them in. Only fall back to single-ticker fetch
+        # when called from one-off code paths (e.g. /api/tickers/:symbol).
         if history is None:
-            history, info = self.fetch_latest_data(symbol)
-        else:
+            history, fetched_info = self.fetch_latest_data(symbol)
+            if info is None:
+                info = fetched_info
+        if info is None:
             info = {}
         if history.empty:
             raise ValueError("No price data returned")
@@ -102,6 +156,53 @@ class TechnicalZoneAnalyzer:
         indicators = compute_indicators(history, spy_history)
         if info.get("earnings_date"):
             indicators["earnings_date"] = info["earnings_date"]
+
+        # ── New signal modules ─────────────────────────────────────────────
+        # 1. Earnings Intelligence
+        try:
+            earnings_sig = analyze_earnings(
+                earnings_date=info.get("earnings_date"),
+                eps_surprise_avg=info.get("eps_surprise_avg"),
+            )
+            indicators.update(earnings_sig)
+        except Exception:
+            pass
+
+        # 2. Sector Relative Strength
+        try:
+            sector_sig = analyze_sector_rs(
+                ticker_history=history,
+                sector=info.get("sector"),
+                sector_etf_history=sector_etf_history,
+            )
+            indicators.update(sector_sig)
+        except Exception:
+            pass
+
+        # 3. Market Regime (use pre-computed if available)
+        try:
+            if regime_data:
+                indicators.update(regime_data)
+            # If not provided, regime_data will be computed in market_data.py and merged later
+        except Exception:
+            pass
+
+        # 4. Insider Transactions
+        try:
+            insider_sig = analyze_insider_activity(info.get("_insider_df"))
+            indicators.update(insider_sig)
+        except Exception:
+            pass
+
+        # 5. Fundamentals Quality
+        try:
+            fund_sig = analyze_fundamentals(
+                info=info.get("_raw_info") or {},
+                asset_type=info.get("asset_type", "stock"),
+            )
+            indicators.update(fund_sig)
+        except Exception:
+            pass
         pivots: list[Pivot] = []
         fib_setup: FibSetup | None = None
         fib_zones: list[FibZone] = []

@@ -232,12 +232,21 @@ def refresh_news() -> dict:
     with db() as conn:
         tickers = rows_to_dicts(conn.execute("SELECT id, symbol, company, asset_type FROM tickers ORDER BY symbol").fetchall())
 
-    for source in RSS_SOURCES:
-        try:
-            items = fetch_feed(source)
-        except Exception as exc:
-            failed.append({"source": source["source"], "feed": source["feed_name"], "reason": str(exc)})
-            continue
+    # Fetch all RSS feeds in parallel (14 feeds × ~1 s each → was 14 s serial,
+    # now ~2 s using a small pool). Per-feed errors don't block the others.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    feed_results: list[tuple[dict, list]] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        future_to_source = {pool.submit(fetch_feed, source): source for source in RSS_SOURCES}
+        for fut in as_completed(future_to_source):
+            source = future_to_source[fut]
+            try:
+                feed_results.append((source, fut.result()))
+            except Exception as exc:
+                failed.append({"source": source["source"], "feed": source["feed_name"], "reason": str(exc)})
+
+    # Single DB transaction across ALL feeds — was N transactions, now 1.
+    for source, items in feed_results:
         fetched += len(items)
         with db() as conn:
             for item in items:

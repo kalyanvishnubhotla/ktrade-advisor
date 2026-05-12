@@ -20,6 +20,7 @@ from .analysis import DISCLAIMER
 from .database import ROOT, db, init_db, rows_to_dicts, seed_defaults, upsert_ticker
 from .fibonacci import cached_fib_zones
 from .market_data import refresh_all, refresh_symbols_list
+from .refresh_engine import manager as refresh_manager
 from .news import RSS_SOURCES, latest_news, news_for_ticker, refresh_news
 from .pivots import cached_pivots, major_swings
 from .recommendation_snapshots import (
@@ -115,12 +116,23 @@ def startup() -> None:
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('enablePortfolioOS', 'false')")
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('enableBacktestingAccuracy', 'false')")
+
+    # Drop expired yfinance cache rows so the table doesn't grow forever
+    try:
+        from .yfinance_cache import cache_purge_expired
+        cache_purge_expired()
+    except Exception:
+        pass
+
+    # Background refresh on first boot — dashboard renders from cached DB state instantly
     threading.Thread(target=safe_startup_refresh, daemon=True).start()
 
 
 def safe_startup_refresh() -> None:
     try:
-        refresh_all()
+        # Use the job manager so the auto-startup refresh is also visible
+        # in /api/refresh/latest and uses the parallel pipeline.
+        refresh_manager.start()
     except Exception:
         pass
 
@@ -273,12 +285,65 @@ def watchlist_summary(conn) -> list[dict]:
 
 @app.post("/api/refresh")
 def refresh() -> dict:
-    return refresh_all()
+    """
+    Kick off a background refresh and return immediately with a job_id.
+
+    The frontend polls /api/refresh/status/{job_id} for progress. Refreshes are
+    idempotent — calling this while one is already running returns the existing
+    job_id, so accidental double-clicks don't spawn duplicate work.
+    """
+    job_id = refresh_manager.start()
+    return {"jobId": job_id, "status": "started"}
+
+
+@app.get("/api/refresh/status/{job_id}")
+def refresh_status(job_id: str) -> dict:
+    """
+    Live progress for a refresh job. Returns 404 if the job_id is unknown
+    (already evicted after 1 hour, or never existed). Frontend polls this
+    every ~1.5 s while a refresh is running.
+    """
+    state = refresh_manager.status(job_id)
+    if state is None:
+        raise HTTPException(404, "Refresh job not found (it may have expired)")
+    return state
+
+
+@app.get("/api/refresh/latest")
+def refresh_latest() -> dict:
+    """Convenience: the most recent refresh job, regardless of whether it's still active."""
+    state = refresh_manager.latest()
+    return state or {"jobId": None, "status": "idle"}
+
+
+@app.post("/api/refresh/sync")
+def refresh_sync() -> dict:
+    """
+    Legacy synchronous refresh — blocks until everything is done.
+    Kept available for testing and the auto-refresh cron-style callers
+    that don't need progressive updates.
+    """
+    return refresh_all(background_news=False)
 
 
 @app.post("/api/news/refresh")
 def refresh_news_endpoint() -> dict:
     return refresh_news()
+
+
+@app.get("/api/cache/stats")
+def cache_stats_endpoint() -> dict:
+    """Return current yfinance cache hit counts + oldest entry age."""
+    from .yfinance_cache import cache_stats
+    return cache_stats()
+
+
+@app.post("/api/cache/clear")
+def cache_clear_endpoint(kind: Optional[str] = None) -> dict:
+    """Clear all (or one kind of) yfinance cache entries. Useful when debugging."""
+    from .yfinance_cache import cache_clear
+    deleted = cache_clear(kind)
+    return {"deleted": deleted, "kind": kind}
 
 
 @app.post("/api/snapshots/{ticker}")
@@ -1222,12 +1287,29 @@ if frontend_dist.exists():
 
 
 def open_browser() -> None:
+    """
+    Auto-open the user's default browser to the dashboard ~1.2 s after launch.
+
+    Skipped silently when running inside Docker (KTRADE_DOCKER=1) — there's
+    no display to open onto inside a container, and webbrowser.open() would
+    emit confusing log noise. The Docker user reads the printed URL from
+    `docker logs` and opens it themselves on the host.
+    """
+    if os.environ.get("KTRADE_DOCKER"):
+        return
     time.sleep(1.2)
     port = int(os.environ.get("KTRADE_PORT", "8000"))
-    webbrowser.open(f"http://127.0.0.1:{port}")
+    try:
+        webbrowser.open(f"http://127.0.0.1:{port}")
+    except Exception:
+        # Don't crash on headless / no-DISPLAY environments
+        pass
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("KTRADE_PORT", "8000"))
-    threading.Thread(target=open_browser, daemon=True).start()
-    uvicorn.run("backend.app.main:app", host="127.0.0.1", port=port, reload=False)
+    # In Docker we always bind 0.0.0.0; on local laptop we stay on loopback.
+    host = "0.0.0.0" if os.environ.get("KTRADE_DOCKER") else "127.0.0.1"
+    if not os.environ.get("KTRADE_DOCKER"):
+        threading.Thread(target=open_browser, daemon=True).start()
+    uvicorn.run("backend.app.main:app", host=host, port=port, reload=False)

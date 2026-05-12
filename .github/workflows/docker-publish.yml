@@ -1,0 +1,144 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Build & publish multi-arch Docker images to GitHub Container Registry (GHCR)
+#
+# WHEN IT RUNS
+#   • Every push to `main` or `perf/refresh-overhaul`  → publishes `:latest`
+#   • Every git tag matching `v*` (e.g. v1.0.0)         → publishes `:1.0.0`, `:1.0`, `:1`
+#   • Every commit                                       → publishes `:sha-abc1234`
+#   • Pull requests                                      → builds only (no push), to validate
+#
+# WHAT IT PRODUCES
+#   ghcr.io/<owner>/ktrade-advisor:<tags>
+#   Two architectures in one manifest:
+#     • linux/amd64  (Intel / AMD)
+#     • linux/arm64  (Apple Silicon, Linux ARM, AWS Graviton)
+#   Docker auto-pulls the right one based on the user's CPU.
+#
+# AUTHENTICATION
+#   Uses the built-in GITHUB_TOKEN — no PAT / no manual secret needed.
+#   The `packages: write` permission below is what lets it push to GHCR.
+#
+# IMAGE VISIBILITY (one-time setup after first publish)
+#   GHCR images default to private. To make them public:
+#     1. Open https://github.com/<owner>/ktrade-advisor/pkgs/container/ktrade-advisor
+#     2. "Package settings" → "Change visibility" → Public
+#   After that anyone can `docker pull` without auth.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+      - perf/refresh-overhaul
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  # Lets you trigger a build manually from the Actions tab
+  workflow_dispatch:
+
+# Concurrency: if you push twice in 30 seconds, cancel the older build so we
+# don't queue up redundant cross-arch builds (each takes ~5 minutes under QEMU).
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # IMAGE_NAME resolves to "kalyanvishnubhotla/ktrade-advisor" automatically
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read       # Read the repo source
+      packages: write      # Push to GHCR
+      id-token: write      # For future provenance/attestation if we add it
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # QEMU lets the x86 runner build arm64 images via CPU emulation.
+      # Without this we could only build linux/amd64.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # Buildx is Docker's next-gen builder that supports multi-platform output.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Skip the login step on pull-request builds — they only validate the
+        # Dockerfile, never push.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive a bunch of useful tags + OCI labels from the git ref.
+      #   main branch       → :latest, :main, :sha-abc1234
+      #   v1.2.3 tag        → :1.2.3, :1.2, :1, :latest
+      #   perf branch       → :perf-refresh-overhaul, :sha-abc1234
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # The two arches that cover ~100% of laptops/servers in 2026:
+          #   linux/amd64 = Intel & AMD desktops + most Linux servers
+          #   linux/arm64 = Apple Silicon Macs, AWS Graviton, Raspberry Pi 4+, modern ARM Linux
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache — second push of unchanged layers is near-instant.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Useful for "where did this image come from?" inspection
+          provenance: true
+          sbom: true
+
+      # Friendly summary in the Actions UI so you can see the published image
+      # name + tags at a glance.
+      - name: Print summary
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "### 🐳 Image published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '${{ steps.meta.outputs.tags }}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Pull it:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo 'docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

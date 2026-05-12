@@ -330,6 +330,26 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_portfolio_tx_symbol ON portfolio_transactions(symbol);
             CREATE INDEX IF NOT EXISTS idx_portfolio_tx_date ON portfolio_transactions(transaction_date);
 
+            -- ── yfinance disk-backed cache ────────────────────────────────────
+            -- TTL-based cache for slow Yahoo Finance lookups. Different fields
+            -- have very different change cadences:
+            --   • price history  → ~5 min (intraday changes)
+            --   • get_info       → ~24 hr (sector, company name barely change)
+            --   • insider_trans  → ~24 hr (SEC filings happen daily at most)
+            --   • earnings_dates → ~24 hr
+            --   • eps_surprise   → ~7 days (only updates each quarter)
+            --   • vix            → ~5 min
+            -- Payload is a Python pickle blob so we can store DataFrames + dicts.
+            CREATE TABLE IF NOT EXISTS yf_cache (
+                kind       TEXT NOT NULL,    -- e.g. 'history', 'info', 'insider'
+                key        TEXT NOT NULL,    -- e.g. 'AAPL' or 'AAPL:2y'
+                cached_at  INTEGER NOT NULL, -- unix epoch seconds
+                ttl_secs   INTEGER NOT NULL, -- cache lifetime
+                payload    BLOB NOT NULL,    -- pickled value
+                PRIMARY KEY (kind, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_yf_cache_age ON yf_cache(cached_at);
+
             -- ── Backtesting & Accuracy module ─────────────────────────────────
             -- tracked_decisions: created when the user clicks "Track this Decision"
             -- on a recommendation card. References a recommendation_snapshots row

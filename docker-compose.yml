@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# KTrade Advisor — Docker Compose
+#
+# This is the friendly "one command and you're running" file for everyone
+# who wants to launch the app without thinking about it.
+#
+# Two usage modes are supported:
+#
+#  1. PULL the published image (default — what most users want):
+#         docker compose up
+#
+#     Compose auto-pulls ghcr.io/kalyanvishnubhotla/ktrade-advisor:latest
+#     for your CPU architecture (linux/amd64 or linux/arm64).
+#
+#  2. BUILD locally (for development, or if you cloned the repo):
+#         docker compose up --build
+#
+# The SQLite database lives in ./data on the host — survives container
+# restarts and image upgrades. Delete that folder to start fresh.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  ktrade:
+    image: ghcr.io/kalyanvishnubhotla/ktrade-advisor:latest
+
+    # Build instructions are kept here so `docker compose up --build` works for
+    # anyone who clones the repo. Compose prefers `image:` if it exists locally,
+    # otherwise tries to pull, otherwise builds with these instructions.
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: ktrade-advisor
+
+    # Map host:container. Change the LEFT side if 8000 is already in use:
+    #   ports: ["8001:8000"]   # then open http://localhost:8001
+    ports:
+      - "8000:8000"
+
+    # Persistent SQLite + yfinance cache. Bind-mount means you can inspect
+    # /Users/you/.../data/ from your host with any SQLite tool while the
+    # container is running.
+    volumes:
+      - ./data:/app/data
+
+    environment:
+      # Tells the app it's running in Docker (suppresses webbrowser.open,
+      # which has no display to open onto)
+      KTRADE_DOCKER: "1"
+      # Optional override if you change the published port above
+      KTRADE_PORT: "8000"
+
+    # Automatically restart unless the user explicitly stops it
+    # (so your Mac waking up from sleep gets the app back without action).
+    restart: unless-stopped
+
+    # Surfaces the Dockerfile HEALTHCHECK in `docker ps` so you can see
+    # whether the API is actually responding, not just whether the process exists.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
