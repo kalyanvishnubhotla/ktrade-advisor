@@ -766,39 +766,168 @@ function NavButton({ page, current, setPage, icon, label }: {
 }
 
 // ── FirstRunGuide ─────────────────────────────────────────────────────────────
+//
+// Two-tab onboarding modal: a 5-step quickstart for impatient users, plus a
+// "What each screen does" reference. Stored-once via localStorage; reopen
+// any time from the "Guide" button in the topbar.
 function FirstRunGuide({ onClose }: { onClose: () => void }) {
-  const steps = [
-    { title: 'Create a watchlist', body: 'Go to Watchlists → create a list → add ticker symbols like AAPL or NVDA.' },
-    { title: 'Run Refresh', body: 'Hit Refresh in the top bar. The engine fetches price data and calculates scores for all tickers.' },
-    { title: 'Read the dashboard', body: 'Each card shows a score (0–100), a decision, and a preferred buy area. Higher score = cleaner setup.' },
-    { title: 'Click any card for details', body: 'See the full checklist, price chart with key zones, signal breakdown, and news matched to that ticker.' },
-    { title: 'Track your decisions', body: 'Hit "Track this decision" to snapshot the recommendation. Later mark what you did — this builds your learning history.' },
+  const [tab, setTab] = useState<'quickstart' | 'screens'>('quickstart');
+
+  const quickstart = [
+    {
+      title: 'Add tickers to a watchlist',
+      body: (
+        <>
+          Click <b>Watchlists</b> in the sidebar. Create a list (e.g. "My Picks") and
+          add ticker symbols you want to track — try popular ones like <code>AAPL</code>,
+          <code>MSFT</code>, <code>NVDA</code>, <code>GOOGL</code>. There's no limit;
+          add as many as you like.
+        </>
+      ),
+    },
+    {
+      title: 'Wait for the first refresh (or click Refresh)',
+      body: (
+        <>
+          The first time you add tickers, the engine fetches ~2 years of price history
+          plus fundamentals from Yahoo Finance. <b>Cold first run takes ~20–30 seconds</b>
+          for ~40 tickers — subsequent refreshes are 5–10× faster thanks to local caching.
+          You'll see a live progress bar in the top right.
+        </>
+      ),
+    },
+    {
+      title: 'Read the Dashboard tiles',
+      body: (
+        <>
+          Each tile shows a <b>setup quality score (0–100)</b>, a plain-English decision
+          (<i>Buy / Wait for better price / Watch / Avoid / Hold</i>), the preferred
+          buy area, target zones, and a risk line. Tiles are sorted by score.
+          Green = strong setup, gold = decent, gray = avoid for now.
+        </>
+      ),
+    },
+    {
+      title: 'Click any tile for the full Ticker Detail',
+      body: (
+        <>
+          See the engine's full reasoning: a price chart with key zones, momentum/trend/volume
+          signal breakdown, recent news matched to that ticker, and a tracked-record summary.
+          Use the <b>Track this decision</b> button to snapshot the recommendation so the
+          app can learn over time.
+        </>
+      ),
+    },
+    {
+      title: 'Optionally enable advanced modules',
+      body: (
+        <>
+          In <b>Settings</b> you can toggle on the optional <b>Portfolio OS</b> tab
+          (import broker CSV/PDF, track holdings) and the <b>Backtesting & Accuracy</b>
+          tab (track decisions over time, see hit-rate, calibration, equity curves).
+          Both are off by default to keep the first-run experience simple.
+        </>
+      ),
+    },
   ];
+
+  const screens: Array<{ name: string; what: string; when: string }> = [
+    { name: 'Dashboard',
+      what: 'Score-sorted grid of every ticker in your watchlists with score, decision, buy area, risk line.',
+      when: 'Your home base. Check first thing in the morning to see what changed overnight.' },
+    { name: 'Watchlists',
+      what: 'Create and edit lists of tickers. Each list is just a group; you can have many.',
+      when: 'Whenever you want to add or remove a ticker, or organize them by theme.' },
+    { name: 'Ticker Detail',
+      what: 'Deep-dive into one ticker: chart with zones, full signal grid, news, snapshot history.',
+      when: 'Click any dashboard tile to land here. Use it before making a decision.' },
+    { name: 'Research Signal',
+      what: 'Paste your own research notes (analyst reports, earnings calls). The app parses them and adjusts the score.',
+      when: 'When you want to inject your own conviction into the engine.' },
+    { name: 'Portfolio  (optional)',
+      what: 'Import broker exports (Robinhood CSV, E*TRADE PDF/CSV). Track holdings, cost basis, P&L, and get hold/sell calls.',
+      when: 'After importing your transaction history. Enable in Settings.' },
+    { name: 'Accuracy  (optional)',
+      what: 'Live track-record: how many tracked decisions hit their targets, calibration curve, simulated equity.',
+      when: 'After tracking 5+ decisions. Enable in Settings.' },
+    { name: 'History',
+      what: 'All saved snapshots across every ticker, oldest to newest. The raw audit log.',
+      when: 'When you want to see what the engine said about a ticker last week, last month.' },
+    { name: 'Learning',
+      what: 'Patterns the engine has noticed: which signal combos win for you, which lose.',
+      when: 'After several weeks of use. Builds a personalised mental model.' },
+    { name: 'Settings',
+      what: 'Toggle optional modules, manage manual portfolio positions, see app info.',
+      when: 'On first launch (to enable modules you want) and rarely after.' },
+  ];
+
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <div className="modal">
+      <div className="modal" style={{ maxWidth: 620 }}>
         <div className="row">
           <div>
             <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 4 }}>Getting started</p>
             <h3>Welcome to KTrade Advisor</h3>
           </div>
-          <button className="btn-ghost btn-sm" onClick={onClose}>Skip</button>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Skip</button>
         </div>
-        <div className="guide-steps">
-          {steps.map((step, i) => (
-            <div className="guide-step" key={i}>
-              <div className="guide-num">{i + 1}</div>
-              <div className="guide-text">
-                <h4>{step.title}</h4>
-                <p>{step.body}</p>
-              </div>
-            </div>
+
+        {/* Tab switcher */}
+        <div style={{ display: 'flex', gap: 'var(--space-1)', borderBottom: '1px solid var(--border-subtle)', marginTop: 'var(--space-3)' }}>
+          {([
+            { k: 'quickstart' as const, label: '5-step quickstart' },
+            { k: 'screens'    as const, label: 'What each screen does' },
+          ]).map(({ k, label }) => (
+            <button key={k} onClick={() => setTab(k)} style={{
+              background: 'none', border: 'none', cursor: 'pointer',
+              padding: 'var(--space-2) var(--space-3)',
+              fontSize: 'var(--text-sm)', fontWeight: tab === k ? 600 : 500,
+              color: tab === k ? 'var(--text-primary)' : 'var(--text-tertiary)',
+              borderBottom: tab === k ? '2px solid var(--blue-text)' : '2px solid transparent',
+              marginBottom: -1,
+            }}>{label}</button>
           ))}
         </div>
-        <button className="btn btn-primary" style={{ width: '100%' }} onClick={() => {
+
+        {tab === 'quickstart' && (
+          <div className="guide-steps" style={{ marginTop: 'var(--space-4)' }}>
+            {quickstart.map((step, i) => (
+              <div className="guide-step" key={i}>
+                <div className="guide-num">{i + 1}</div>
+                <div className="guide-text">
+                  <h4>{step.title}</h4>
+                  <p>{step.body}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === 'screens' && (
+          <div style={{ marginTop: 'var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-3)', maxHeight: 420, overflowY: 'auto' }}>
+            {screens.map((s) => (
+              <div key={s.name} style={{ padding: 'var(--space-3)', background: 'var(--bg-surface-2)', borderRadius: 10, border: '1px solid var(--border-subtle)' }}>
+                <div style={{ fontWeight: 600, fontSize: 'var(--text-sm)', marginBottom: 4 }}>{s.name}</div>
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 4 }}>
+                  <b style={{ color: 'var(--text-primary)' }}>What:</b> {s.what}
+                </div>
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                  <b style={{ color: 'var(--text-primary)' }}>When to use:</b> {s.when}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <button className="btn btn-primary" style={{ width: '100%', marginTop: 'var(--space-4)' }} onClick={() => {
           window.localStorage.setItem('ktrade_onboarding_seen', 'true');
           onClose();
-        }}>Got it, let's go</button>
+        }}>
+          {tab === 'quickstart' ? "Got it, let's go" : 'Done'}
+        </button>
+        <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textAlign: 'center', marginTop: 'var(--space-2)' }}>
+          You can reopen this guide any time via the <b>Guide</b> button in the top right.
+        </p>
       </div>
     </div>
   );

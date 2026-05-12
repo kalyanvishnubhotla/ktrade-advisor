@@ -1287,12 +1287,29 @@ if frontend_dist.exists():
 
 
 def open_browser() -> None:
+    """
+    Auto-open the user's default browser to the dashboard ~1.2 s after launch.
+
+    Skipped silently when running inside Docker (KTRADE_DOCKER=1) — there's
+    no display to open onto inside a container, and webbrowser.open() would
+    emit confusing log noise. The Docker user reads the printed URL from
+    `docker logs` and opens it themselves on the host.
+    """
+    if os.environ.get("KTRADE_DOCKER"):
+        return
     time.sleep(1.2)
     port = int(os.environ.get("KTRADE_PORT", "8000"))
-    webbrowser.open(f"http://127.0.0.1:{port}")
+    try:
+        webbrowser.open(f"http://127.0.0.1:{port}")
+    except Exception:
+        # Don't crash on headless / no-DISPLAY environments
+        pass
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("KTRADE_PORT", "8000"))
-    threading.Thread(target=open_browser, daemon=True).start()
-    uvicorn.run("backend.app.main:app", host="127.0.0.1", port=port, reload=False)
+    # In Docker we always bind 0.0.0.0; on local laptop we stay on loopback.
+    host = "0.0.0.0" if os.environ.get("KTRADE_DOCKER") else "127.0.0.1"
+    if not os.environ.get("KTRADE_DOCKER"):
+        threading.Thread(target=open_browser, daemon=True).start()
+    uvicorn.run("backend.app.main:app", host=host, port=port, reload=False)

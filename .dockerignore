@@ -1,0 +1,68 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Files & directories the Docker build context should NEVER include.
+#
+# Smaller context = faster builds + smaller images + fewer leaks.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Local development state ──────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node / frontend ──────────────────────────────────────────────────────────
+# We build the frontend INSIDE the image (multi-stage), so host node_modules
+# and existing dist/ are irrelevant — and copying them in would conflict
+# with the build stage.
+frontend/node_modules/
+frontend/dist/
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ── Data files ───────────────────────────────────────────────────────────────
+# The SQLite database is bind-mounted as a volume at runtime; it must NOT
+# be baked into the image (would ship someone else's data + balloon size).
+data/
+backend/ktrade.db
+*.db
+*.sqlite3
+*.sqlite
+
+# ── Git ──────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── Editor / OS noise ────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ── Claude Code / worktrees ─────────────────────────────────────────────────
+.claude/
+.worktrees/
+
+# ── CI / Docker meta ─────────────────────────────────────────────────────────
+.github/
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# ── Documentation that's not needed at runtime ──────────────────────────────
+README.md
+CHANGELOG.md
+docs/
+*.md
+LICENSE
+
+# ── Local launchers (not used inside the container) ─────────────────────────
+start.sh
+start.command
