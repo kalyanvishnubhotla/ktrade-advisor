@@ -3682,6 +3682,14 @@ function App() {
   const [toast, setToast] = useState('');
   const [showGuide, setShowGuide] = useState(false);
 
+  // Live progress streamed from /api/refresh/status/:jobId while a refresh is running.
+  // The user sees "Refreshed 14 / 32 — NVDA" instead of a frozen spinner.
+  const [refreshProgress, setRefreshProgress] = useState<{
+    phase: string; completed: number; total: number;
+    current: string | null; recent: string[];
+    durationSeconds: number | null;
+  } | null>(null);
+
   const load = async () => {
     setError('');
     setLoading(true);
@@ -3695,18 +3703,91 @@ function App() {
     if (window.localStorage.getItem('ktrade_onboarding_seen') !== 'true') setShowGuide(true);
   }, []);
 
+  /**
+   * Async progressive refresh:
+   *   1. POST /api/refresh → returns instantly with {jobId}
+   *   2. Re-fetch the dashboard from current cache so the user sees something now
+   *   3. Poll /api/refresh/status/:jobId every 1.5 s for per-ticker progress
+   *   4. As tickers finish, refresh the dashboard incrementally (so the UI feels alive)
+   *   5. When status === 'complete' OR 'failed', stop polling and do a final dashboard load
+   *
+   * The old behaviour blocked the entire UI on one giant POST that took minutes.
+   * Now the user sees the dashboard immediately and watches it update tile-by-tile.
+   */
   const refresh = async () => {
     setRefreshing(true); setError(''); setToast('');
+    setRefreshProgress({ phase: 'queued', completed: 0, total: 0, current: null, recent: [], durationSeconds: null });
+
+    let jobId: string | null = null;
     try {
-      const result = await sendJson<{ snapshots_saved?: number }>('/api/refresh');
-      if (result.snapshots_saved) {
-        setToast(`Snapshot saved for ${result.snapshots_saved} ticker${result.snapshots_saved === 1 ? '' : 's'}.`);
-        window.setTimeout(() => setToast(''), 4200);
-      }
-      await load();
+      const start = await sendJson<{ jobId: string; status: string }>('/api/refresh');
+      jobId = start.jobId;
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Refresh failed');
-    } finally { setRefreshing(false); }
+      setRefreshing(false);
+      setRefreshProgress(null);
+      setError(err instanceof Error ? err.message : 'Refresh failed to start');
+      return;
+    }
+
+    // Immediately re-render the dashboard from current SQLite state — the user
+    // doesn't have to stare at a spinner waiting for fresh data to land.
+    await load();
+
+    // Poll for progress and refresh the dashboard every few completed tickers
+    // so individual tiles light up as their new scores come in.
+    let lastRefreshAtCompleted = 0;
+    const REFRESH_CHUNK = 8;       // re-fetch /api/dashboard every N tickers
+    const POLL_INTERVAL_MS = 1200;
+
+    const stopPolling = (final: boolean) => new Promise<void>((resolve) => {
+      const interval = window.setInterval(async () => {
+        try {
+          const status = await getJson<any>(`/api/refresh/status/${jobId}`);
+          setRefreshProgress({
+            phase:           status.phase,
+            completed:       status.completed,
+            total:           status.total,
+            current:         status.current,
+            recent:          status.recent || [],
+            durationSeconds: status.durationSeconds ?? null,
+          });
+
+          // Incrementally refresh the dashboard as chunks of tickers complete
+          if (status.completed - lastRefreshAtCompleted >= REFRESH_CHUNK) {
+            lastRefreshAtCompleted = status.completed;
+            // Don't await — let it overlap with the next poll
+            void load();
+          }
+
+          if (status.status === 'complete' || status.status === 'failed') {
+            window.clearInterval(interval);
+            await load();   // final refresh to pick up the last cards
+            const summary = status.resultSummary || {};
+            if (status.status === 'complete') {
+              const dur = status.durationSeconds ?? summary.durationSeconds;
+              setToast(
+                `Refreshed ${summary.refreshedCount ?? 0} tickers` +
+                (summary.failedCount ? ` · ${summary.failedCount} failed` : '') +
+                (dur != null ? ` · ${dur}s` : '')
+              );
+              window.setTimeout(() => setToast(''), 5000);
+            } else {
+              setError(status.errors?.[0]?.reason || 'Refresh failed');
+            }
+            setRefreshProgress(null);
+            setRefreshing(false);
+            resolve();
+          }
+        } catch (e) {
+          // Job evicted / network blip — stop gracefully
+          window.clearInterval(interval);
+          setRefreshing(false);
+          setRefreshProgress(null);
+          resolve();
+        }
+      }, POLL_INTERVAL_MS);
+    });
+    await stopPolling(true);
   };
 
   const { marketOpen, formatCountdown } = useAutoRefresh(refresh);
@@ -3797,6 +3878,33 @@ function App() {
             </span>
           </div>
           <div className="topbar-right">
+            {/* Live progress while a refresh is running — shows what the user is actually waiting on */}
+            {refreshing && refreshProgress && refreshProgress.total > 0 && (
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+                padding: '6px 12px', borderRadius: 999,
+                background: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)',
+                fontSize: 'var(--text-xs)', color: 'var(--text-secondary)',
+              }}>
+                <span style={{
+                  width: 70, height: 4, borderRadius: 2,
+                  background: 'var(--bg-surface-2)', overflow: 'hidden', display: 'inline-block', position: 'relative',
+                }}>
+                  <span style={{
+                    position: 'absolute', top: 0, left: 0, height: '100%',
+                    width: `${Math.min(100, (refreshProgress.completed / Math.max(1, refreshProgress.total)) * 100)}%`,
+                    background: 'var(--green-text)', transition: 'width 0.4s ease',
+                  }} />
+                </span>
+                <span style={{ fontFamily: 'var(--font-mono)' }}>
+                  {refreshProgress.completed} / {refreshProgress.total}
+                </span>
+                {refreshProgress.current && (
+                  <span style={{ color: 'var(--text-tertiary)' }}>· {refreshProgress.current}</span>
+                )}
+              </span>
+            )}
+
             {/* Auto-refresh badge */}
             <span className={`auto-refresh-badge ${marketOpen ? 'market-open' : ''}`}>
               <span className="refresh-pulse" />
@@ -3807,7 +3915,7 @@ function App() {
               className="btn btn-secondary btn-sm"
               onClick={refresh}
               disabled={refreshing}
-              title="Refresh all data now"
+              title="Refresh all data now — runs in background, updates tile by tile"
             >
               <RefreshCw size={14} className={refreshing ? 'spinning' : ''} />
               {refreshing ? 'Refreshing…' : 'Refresh'}
