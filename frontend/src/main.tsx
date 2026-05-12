@@ -1012,8 +1012,9 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
   const [tracking, setTracking] = useState(false);
-  const [trackingForAccuracy, setTrackingForAccuracy] = useState(false);
   const [backtestingEnabled, setBacktestingEnabled] = useState(false);
+  // Snapshot IDs already registered in the Backtesting module — used elsewhere to
+  // gate a future "Already tracking" pill on past snapshots.
   const [accuracyTrackedIds, setAccuracyTrackedIds] = useState<Set<number>>(new Set());
 
   // Pull settings once so we know whether to render the "Track for accuracy" CTA
@@ -1049,28 +1050,6 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
 
   useEffect(() => { load(symbol); }, [symbol, backtestingEnabled]);
 
-  /**
-   * Track-for-accuracy flow:
-   * 1. Make sure a fresh snapshot exists (call /api/snapshots/:ticker/track-current)
-   * 2. Fetch the latest snapshot for this ticker
-   * 3. POST to /api/backtesting/decisions with that snapshot_id
-   */
-  const trackForAccuracy = async () => {
-    if (!detail) return;
-    setTrackingForAccuracy(true); setStatus('');
-    try {
-      await sendJson(`/api/snapshots/${encodeURIComponent(detail.ticker.symbol)}/track-current`);
-      const latest = await getJson<RecommendationSnapshot[]>(`/api/snapshots/${detail.ticker.symbol}?limit=1`);
-      if (!latest.length) throw new Error('No snapshot found after tracking');
-      const newDecision = await btTrackDecision(latest[0].id);
-      setStatus(`Now tracking ${detail.ticker.symbol} for accuracy. Check the Accuracy tab to see how it plays out.`);
-      setAccuracyTrackedIds(prev => new Set(prev).add(newDecision.snapshot_id));
-      await load(detail.ticker.symbol);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to track decision');
-    } finally { setTrackingForAccuracy(false); }
-  };
-
   const score = detail?.scores?.[0];
   const indicators = detail?.indicators;
   const zones = (detail?.sr_zones || []) as SRZone[];
@@ -1097,33 +1076,45 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
             <div className="hero-right">
               <ScoreBadge score={score?.score} size="lg" />
               <DecisionPill decision={score?.decision} />
-              <button className="track-btn" disabled={tracking || !score || !indicators?.price} onClick={async () => {
-                setTracking(true); setStatus('');
-                try {
-                  await sendJson(`/api/snapshots/${encodeURIComponent(detail.ticker.symbol)}/track-current`);
-                  setStatus('Snapshot saved. This helps the app learn over time.');
-                  await load(detail.ticker.symbol);
-                } finally { setTracking(false); }
-              }}>
-                <Clock size={14} />{tracking ? 'Tracking...' : 'Track this decision'}
+              {/*
+                Single "Track this decision" button. Always saves a snapshot.
+                When the Backtesting & Accuracy module is enabled, the same click
+                also registers the snapshot as a tracked decision so the Accuracy
+                tab follows the outcome automatically — no duplicate UI.
+              */}
+              <button
+                className="track-btn"
+                disabled={tracking || !score || !indicators?.price}
+                onClick={async () => {
+                  if (!detail) return;
+                  setTracking(true); setStatus('');
+                  try {
+                    await sendJson(`/api/snapshots/${encodeURIComponent(detail.ticker.symbol)}/track-current`);
+                    if (backtestingEnabled) {
+                      const latest = await getJson<RecommendationSnapshot[]>(`/api/snapshots/${detail.ticker.symbol}?limit=1`);
+                      if (latest.length) {
+                        try {
+                          const newDecision = await btTrackDecision(latest[0].id);
+                          setAccuracyTrackedIds(prev => new Set(prev).add(newDecision.snapshot_id));
+                          setStatus(`Tracking ${detail.ticker.symbol} — open the Accuracy tab to follow the outcome.`);
+                        } catch {
+                          setStatus('Snapshot saved. (Already tracked for accuracy or backend unavailable.)');
+                        }
+                      } else {
+                        setStatus('Snapshot saved.');
+                      }
+                    } else {
+                      setStatus('Snapshot saved. This helps the app learn over time.');
+                    }
+                    await load(detail.ticker.symbol);
+                  } finally { setTracking(false); }
+                }}
+                title={backtestingEnabled
+                  ? 'Save a snapshot and start tracking how the call plays out in the Accuracy tab.'
+                  : 'Save a point-in-time snapshot of this recommendation. Mark the outcome later to build your learning history.'}
+              >
+                <Clock size={14} />{tracking ? 'Tracking…' : 'Track this decision'}
               </button>
-
-              {/* Track-for-Accuracy CTA — only when the Backtesting module is enabled */}
-              {backtestingEnabled && (
-                <button
-                  className="track-btn"
-                  disabled={trackingForAccuracy || !score || !indicators?.price}
-                  onClick={trackForAccuracy}
-                  style={{
-                    background: 'var(--green-muted)',
-                    border: '1px solid var(--green-dim)',
-                    color: 'var(--green-text)',
-                  }}
-                  title="Save this recommendation as a tracked decision so the Accuracy module can follow the outcome day by day."
-                >
-                  <Target size={14} />{trackingForAccuracy ? 'Adding…' : 'Track for accuracy'}
-                </button>
-              )}
             </div>
           </div>
 
@@ -3281,9 +3272,9 @@ function BacktestingDashboardView({
         </div>
         <h2 style={{ fontSize: 'var(--text-xl)', marginBottom: 8 }}>Start building your accuracy history</h2>
         <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-          When you find a recommendation you want to follow, click <b>"Track for accuracy"</b> on its ticker card.
-          We'll watch the price every day and tell you exactly how the call played out — buy zone hit, target reached,
-          risk line breached, or still active.
+          When you find a recommendation you want to follow, click <b>"Track this decision"</b> on its ticker card
+          or detail page. Because you've enabled the Accuracy module, that single click both saves a snapshot and
+          starts following the outcome here — buy zone hit, target reached, risk line breached, or still active.
         </p>
         <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-5)', lineHeight: 1.7 }}>
           After about 5 closed decisions you'll unlock reliability scores and a calibration curve. Until then,
@@ -3720,10 +3711,34 @@ function App() {
 
   const { marketOpen, formatCountdown } = useAutoRefresh(refresh);
 
+  /**
+   * Single source of truth for tracking a decision from anywhere in the app.
+   *   1. Always save a snapshot (existing behaviour — feeds Learning Insights)
+   *   2. If the Backtesting & Accuracy module is enabled, ALSO register the
+   *      latest snapshot as a tracked_decision so the Accuracy tab can follow
+   *      it day by day. One click, two outcomes — no duplicate UI required.
+   */
   const onTrack = async (symbol: string) => {
     await sendJson(`/api/snapshots/${encodeURIComponent(symbol)}/track-current`);
-    setToast(`Snapshot saved for ${symbol}.`);
-    window.setTimeout(() => setToast(''), 3000);
+
+    const accuracyOn = (dashboard?.settings as any)?.enable_backtesting_accuracy ?? false;
+    if (accuracyOn) {
+      try {
+        const [latest] = await getJson<RecommendationSnapshot[]>(`/api/snapshots/${encodeURIComponent(symbol)}?limit=1`);
+        if (latest) {
+          await btTrackDecision(latest.id);
+          setToast(`Tracking ${symbol} — open the Accuracy tab to follow the outcome.`);
+        } else {
+          setToast(`Snapshot saved for ${symbol}.`);
+        }
+      } catch {
+        // Backtesting registration failed (likely already tracked) — fall back to snapshot-only msg
+        setToast(`Snapshot saved for ${symbol}.`);
+      }
+    } else {
+      setToast(`Snapshot saved for ${symbol}.`);
+    }
+    window.setTimeout(() => setToast(''), 3500);
   };
 
   const goToTicker = (symbol: string) => {
