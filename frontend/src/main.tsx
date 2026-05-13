@@ -1,6 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ColorType, createChart, LineSeries, LineStyle } from 'lightweight-charts';
+import {
+  CandlestickSeries,
+  ColorType,
+  createChart,
+  HistogramSeries,
+  LineSeries,
+  LineStyle,
+} from 'lightweight-charts';
 import { PieChart, Pie, Cell, Tooltip as RCTooltip, ResponsiveContainer, Legend } from 'recharts';
 import {
   Activity,
@@ -454,35 +461,151 @@ function ZoneList({ zones }: { zones: SRZone[] }) {
   );
 }
 
-// ── PriceChart ────────────────────────────────────────────────────────────────
-function PriceChart({ prices, score, indicators }: {
-  prices: Array<{ date: string; close: number; volume?: number }>;
-  score: any; indicators: any;
+// ─────────────────────────────────────────────────────────────────────────────
+// PriceChart  —  with optional "Pro Chart Analysis" mode
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Two visual modes, controlled by a single toggle in the chart header:
+//
+//   • Default (clean) — Line chart with the 5 calm KTrade levels (Buy zone,
+//     Now, Risk, T1, T2). Same as it's always been. No noise.
+//
+//   • Pro Analysis    — Adds professional technical layers as a non-destructive
+//     overlay on top of a candlestick view: Fibonacci retracements + extensions,
+//     EMA21 / SMA50 / SMA200, colored volume histogram, candlestick pattern
+//     markers (Engulfing / Hammer / Shooting Star / Doji), and an educational
+//     legend with plain-English tooltips on every overlay.
+//
+// All Pro-mode data is pre-computed backend-side and arrives in
+// `proChart` as part of the /api/tickers/{symbol} payload. The frontend is
+// purely a presentation layer — no ta-lib in the browser.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pro Chart fields the backend sends us when proMode is on.
+type ProChartPayload = {
+  ema21:  Array<{ time: string; value: number }>;
+  sma50:  Array<{ time: string; value: number }>;
+  sma200: Array<{ time: string; value: number }>;
+  fib: null | {
+    direction:   'up' | 'down' | string;
+    start_date:  string; start_price: number;
+    end_date:    string; end_price:   number;
+    swing_pct:   number;
+    levels: Array<{
+      ratio:   number;
+      price:   number;
+      label:   string;
+      kind:    'retracement' | 'extension';
+      summary: string;
+    }>;
+  };
+  patterns: Array<{
+    date:      string;
+    type:      string;
+    label:     string;
+    direction: 'bullish' | 'bearish' | 'neutral';
+    icon:      string;
+    price:     number;
+    summary:   string;
+  }>;
+};
+
+// Tiny helper used by the educational tooltip popovers. Keeps copy in ONE
+// place so we never let stale strings leak into the UI.
+const PRO_OVERLAY_HELP = {
+  ema21:  "Exponential 21-period moving average. Reacts faster than longer averages — many short-term traders use it as a dynamic line of support during uptrends.",
+  sma50:  "Simple 50-period moving average. A medium-term trend reference. Crossings above/below the 200 are widely watched.",
+  sma200: "Simple 200-period moving average. The long-term tide. Price above = bull regime tendency; below = bear regime tendency.",
+  fibRet: "Fibonacci retracement. After a strong move, these levels often mark where pullbacks pause before resuming. The 0.618 (golden) and 0.50 are the most-watched.",
+  fibExt: "Fibonacci extension. When price breaks beyond the prior swing high, these levels become common profit-take zones (1.272 and 1.618 are classic targets).",
+  volume: "Volume bars colored by the day's price action — green when the close was up, red when it was down. Heavy green bars on rallies = real buying; heavy red on declines = real selling.",
+  patterns: "Detected candlestick patterns. These are 'signals worth a second look' — never standalone trade triggers. Use them as one input among many.",
+};
+
+function PriceChart({ prices, score, indicators, proChart }: {
+  prices: Array<{ date: string; open?: number; high?: number; low?: number; close: number; volume?: number }>;
+  score: any;
+  indicators: any;
+  proChart?: ProChartPayload;
 }) {
+  // ── State for the Pro Analysis toggle (persisted across visits to the page) ──
+  const [proMode, setProMode] = useState<boolean>(() => {
+    try { return window.localStorage.getItem('ktrade_pro_chart') === 'true'; }
+    catch { return false; }
+  });
+  const [legendOpen, setLegendOpen] = useState(false);
+  // Hover state for the "what does this mean?" popover floating panel.
+  const [helpKey, setHelpKey] = useState<string | null>(null);
+
+  const togglePro = () => {
+    const next = !proMode;
+    setProMode(next);
+    try { window.localStorage.setItem('ktrade_pro_chart', String(next)); } catch {}
+    if (next && !legendOpen) setLegendOpen(true);    // first-time hint
+  };
+
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
-  const buyRange = parseMoneyRange(score?.entry_range);
-  const riskLine = parseMoneyValue(score?.invalidation_level);
-  const target1 = parseMoneyValue(score?.target1);
-  const target2 = parseMoneyValue(score?.target2);
+
+  const buyRange     = parseMoneyRange(score?.entry_range);
+  const riskLine     = parseMoneyValue(score?.invalidation_level);
+  const target1      = parseMoneyValue(score?.target1);
+  const target2      = parseMoneyValue(score?.target2);
   const currentPrice = indicators?.price;
-  const firstTarget = target1 && currentPrice && target1 > currentPrice ? target1 : undefined;
+  const firstTarget  = target1 && currentPrice && target1 > currentPrice ? target1 : undefined;
   const secondTarget = target2 && currentPrice && target2 > currentPrice && target2 !== firstTarget ? target2 : undefined;
 
-  const chartData = useMemo(
-    () => prices
-      .filter((p) => p.date && typeof p.close === 'number')
-      .map((p) => ({ time: p.date, value: Number(p.close) })),
+  // Detect whether we actually have OHLC available — if not, candlestick mode
+  // gracefully falls back to a line series even if Pro is toggled on.
+  const hasOHLC = useMemo(
+    () => prices.length > 0 && prices.every(p => typeof p.open === 'number' && typeof p.high === 'number' && typeof p.low === 'number'),
     [prices]
   );
 
+  // Line-series data (default mode)
+  const lineData = useMemo(
+    () => prices.filter(p => p.date && typeof p.close === 'number')
+                .map(p => ({ time: p.date, value: Number(p.close) })),
+    [prices]
+  );
+
+  // Candlestick-series data (Pro mode)
+  const candleData = useMemo(
+    () => prices.filter(p => p.date && typeof p.close === 'number')
+                .map(p => ({
+                  time:  p.date,
+                  open:  Number(p.open  ?? p.close),
+                  high:  Number(p.high  ?? p.close),
+                  low:   Number(p.low   ?? p.close),
+                  close: Number(p.close),
+                })),
+    [prices]
+  );
+
+  // Colored volume histogram (Pro mode). Color depends on whether the day's
+  // close was up (green) or down (red) compared to the open.
+  const volumeData = useMemo(
+    () => prices.map(p => {
+      const up = (p.open != null && p.close != null) ? Number(p.close) >= Number(p.open) : true;
+      return {
+        time:  p.date,
+        value: Number(p.volume ?? 0),
+        color: up ? 'rgba(34, 197, 94, 0.55)' : 'rgba(239, 68, 68, 0.55)',
+      };
+    }).filter(d => d.value > 0),
+    [prices]
+  );
+
+  // ── Chart construction effect ────────────────────────────────────────────
+  // We rebuild on proMode flip — simpler than diffing all the overlays. The
+  // chart is small (260 bars), so the rebuild is imperceptible.
   useEffect(() => {
     const container = chartContainerRef.current;
-    if (!container || !chartData.length) return;
+    if (!container || !lineData.length) return;
     container.replaceChildren();
 
     const chart = createChart(container, {
-      height: 420,
+      height: proMode ? 480 : 420,
       autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: '#111111' },
@@ -495,7 +618,7 @@ function PriceChart({ prices, score, indicators }: {
       },
       rightPriceScale: {
         borderColor: '#2a2a2a',
-        scaleMargins: { top: 0.12, bottom: 0.16 },
+        scaleMargins: { top: 0.10, bottom: proMode ? 0.28 : 0.16 },  // leave room for volume in pro
       },
       timeScale: {
         borderColor: '#2a2a2a',
@@ -513,19 +636,37 @@ function PriceChart({ prices, score, indicators }: {
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
     });
 
-    const priceSeries = chart.addSeries(LineSeries, {
-      color: '#ffffff',
-      lineWidth: 2,
-      lastValueVisible: false,
-      priceLineVisible: false,
-      crosshairMarkerVisible: true,
-      crosshairMarkerRadius: 5,
-    });
-    priceSeries.setData(chartData as any);
+    // ── Main price series (line vs candlestick depending on mode) ──
+    let priceSeries: any;
+    if (proMode && hasOHLC) {
+      // Soft, calm colors that don't fight the KTrade dark theme.
+      priceSeries = chart.addSeries(CandlestickSeries, {
+        upColor:        '#22c55e',
+        downColor:      '#ef4444',
+        borderUpColor:  '#22c55e',
+        borderDownColor:'#ef4444',
+        wickUpColor:    '#22c55e',
+        wickDownColor:  '#ef4444',
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      priceSeries.setData(candleData as any);
+    } else {
+      priceSeries = chart.addSeries(LineSeries, {
+        color: '#ffffff',
+        lineWidth: 2,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        crosshairMarkerVisible: true,
+        crosshairMarkerRadius: 5,
+      });
+      priceSeries.setData(lineData as any);
+    }
 
+    // ── KTrade calm levels — same in both modes ──────────────────────
     if (buyRange) {
       priceSeries.createPriceLine({ price: buyRange.high, color: '#00C805', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `Buy high $${buyRange.high.toFixed(2)}` });
-      priceSeries.createPriceLine({ price: buyRange.low, color: '#00C805', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `Buy low $${buyRange.low.toFixed(2)}` });
+      priceSeries.createPriceLine({ price: buyRange.low,  color: '#00C805', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `Buy low $${buyRange.low.toFixed(2)}` });
     }
     if (currentPrice) {
       priceSeries.createPriceLine({ price: currentPrice, color: '#3B82F6', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `Now $${currentPrice.toFixed(2)}` });
@@ -540,6 +681,76 @@ function PriceChart({ prices, score, indicators }: {
       priceSeries.createPriceLine({ price: secondTarget, color: '#F5A623', lineWidth: 1, lineStyle: LineStyle.LargeDashed, axisLabelVisible: true, title: `T2 $${secondTarget.toFixed(2)}` });
     }
 
+    // ── PRO MODE OVERLAYS ─────────────────────────────────────────────
+    // Everything below is gated on `proMode` — turning the toggle off
+    // produces exactly the chart we had before.
+    if (proMode && proChart) {
+      // Moving averages — soft, distinct colors (no neon).
+      const addMA = (data: any[], color: string, title: string) => {
+        if (!data || data.length === 0) return null;
+        const s = chart.addSeries(LineSeries, {
+          color,
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: true,
+          title,
+        });
+        s.setData(data as any);
+        return s;
+      };
+      addMA(proChart.ema21,  '#06b6d4', 'EMA 21');   // cyan, like Schwab
+      addMA(proChart.sma50,  '#f59e0b', 'SMA 50');   // amber
+      addMA(proChart.sma200, '#c084fc', 'SMA 200');  // soft purple
+
+      // Fibonacci levels — drawn as horizontal price lines on the price series.
+      // Retracements get solid soft-pink, extensions get dotted bright-pink.
+      if (proChart.fib?.levels) {
+        for (const lvl of proChart.fib.levels) {
+          const isExt = lvl.kind === 'extension';
+          priceSeries.createPriceLine({
+            price:     lvl.price,
+            color:     isExt ? '#ec4899' : '#fb7185',
+            lineWidth: 1,
+            lineStyle: isExt ? LineStyle.Dotted : LineStyle.Dashed,
+            axisLabelVisible: true,
+            title:     lvl.label,
+          });
+        }
+      }
+
+      // Volume histogram in its own price scale at the bottom (overlay style).
+      if (volumeData.length > 0) {
+        const volSeries = chart.addSeries(HistogramSeries, {
+          priceFormat: { type: 'volume' },
+          priceScaleId: '',  // overlay scale, sits at the bottom
+          color: 'rgba(34, 197, 94, 0.55)',
+        });
+        volSeries.priceScale().applyOptions({
+          scaleMargins: { top: 0.78, bottom: 0 },  // pin to bottom ~22% of chart
+        });
+        volSeries.setData(volumeData as any);
+      }
+
+      // Candlestick pattern markers (require setMarkers on a series).
+      if (proChart.patterns && proChart.patterns.length > 0 && typeof (priceSeries as any).setMarkers === 'function') {
+        const markers = proChart.patterns.map(p => ({
+          time:     p.date,
+          position: p.direction === 'bullish' ? ('belowBar' as const)
+                  : p.direction === 'bearish' ? ('aboveBar' as const)
+                  : ('inBar' as const),
+          color:    p.direction === 'bullish' ? '#22c55e'
+                  : p.direction === 'bearish' ? '#ef4444'
+                  : '#94a3b8',
+          shape:    p.direction === 'bullish' ? ('arrowUp' as const)
+                  : p.direction === 'bearish' ? ('arrowDown' as const)
+                  : ('circle' as const),
+          text:     p.label,
+        }));
+        try { (priceSeries as any).setMarkers(markers); }
+        catch { /* gracefully skip if lightweight-charts version differs */ }
+      }
+    }
+
     chart.timeScale().fitContent();
 
     const tooltip = tooltipRef.current;
@@ -548,27 +759,34 @@ function PriceChart({ prices, score, indicators }: {
         if (tooltip) tooltip.style.display = 'none';
         return;
       }
-      const data = param.seriesData.get(priceSeries) as { value?: number } | undefined;
-      if (!data?.value) { tooltip.style.display = 'none'; return; }
+      const data = param.seriesData.get(priceSeries) as any;
+      if (!data) { tooltip.style.display = 'none'; return; }
       tooltip.style.display = 'block';
-      tooltip.style.left = `${Math.min(param.point.x + 14, container.clientWidth - 170)}px`;
-      tooltip.style.top = `${Math.max(param.point.y - 48, 8)}px`;
-      tooltip.innerHTML = `<b>${String(param.time)}</b><span>$${data.value.toFixed(2)}</span>`;
+      tooltip.style.left = `${Math.min(param.point.x + 14, container.clientWidth - 200)}px`;
+      tooltip.style.top = `${Math.max(param.point.y - 60, 8)}px`;
+      const value = data.value ?? data.close;
+      const html = (data.open != null)
+        ? `<b>${String(param.time)}</b>
+           <span>O ${data.open.toFixed(2)} · H ${data.high.toFixed(2)} · L ${data.low.toFixed(2)}</span>
+           <span><b>C ${data.close.toFixed(2)}</b></span>`
+        : `<b>${String(param.time)}</b><span>$${value.toFixed(2)}</span>`;
+      tooltip.innerHTML = html;
     });
 
     const ro = new ResizeObserver(() => chart.applyOptions({ width: container.clientWidth }));
     ro.observe(container);
     (container as any).__ktradeChart = chart;
     return () => { ro.disconnect(); chart.remove(); };
-  }, [chartData, buyRange?.high, buyRange?.low, currentPrice, riskLine, firstTarget, secondTarget]);
+  }, [lineData, candleData, volumeData, hasOHLC, proMode, proChart, buyRange?.high, buyRange?.low, currentPrice, riskLine, firstTarget, secondTarget]);
 
   const setRange = (bars: number | 'all') => {
     const chart = (chartContainerRef.current as any)?.__ktradeChart;
-    if (!chart || !chartData.length) return;
+    if (!chart || !lineData.length) return;
     if (bars === 'all') { chart.timeScale().fitContent(); return; }
-    chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, chartData.length - bars), to: chartData.length + 8 });
+    chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, lineData.length - bars), to: lineData.length + 8 });
   };
 
+  // ── Render ───────────────────────────────────────────────────────────────
   return (
     <article className="chart-panel">
       <div className="chart-head">
@@ -576,23 +794,176 @@ function PriceChart({ prices, score, indicators }: {
           <h3>Price Chart</h3>
           <p>Scroll to zoom · drag to pan · key levels on right axis</p>
         </div>
-        <div className="chart-controls">
+        <div className="chart-controls" style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center', flexWrap: 'wrap' }}>
           <button onClick={() => setRange(65)}>3M</button>
           <button onClick={() => setRange(130)}>6M</button>
           <button onClick={() => setRange(260)}>1Y</button>
           <button onClick={() => setRange('all')}>All</button>
+
+          {/* Pro Analysis toggle — sits to the right of the time-range buttons,
+              styled distinctly so it's discoverable but not loud. */}
+          <button
+            onClick={togglePro}
+            title={proMode ? 'Switch back to the clean view' : 'Layer professional technical analysis on top of the chart'}
+            style={{
+              marginLeft: 'var(--space-2)',
+              padding: '4px 10px',
+              fontSize: 'var(--text-xs)',
+              fontWeight: 600,
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              borderRadius: 8,
+              background: proMode ? 'var(--green-muted)' : 'var(--bg-surface-3)',
+              border: `1px solid ${proMode ? 'var(--green-dim)' : 'var(--border-subtle)'}`,
+              color: proMode ? 'var(--green-text)' : 'var(--text-secondary)',
+              cursor: 'pointer',
+            }}
+          >
+            <span>{proMode ? '✓ Pro Analysis' : 'Pro Analysis'}</span>
+            <span style={{
+              fontSize: 9, padding: '2px 6px', borderRadius: 4,
+              background: proMode ? 'var(--green-dim)' : 'var(--bg-surface-2)',
+              color: proMode ? '#fff' : 'var(--text-tertiary)',
+              fontWeight: 700, letterSpacing: 0.3,
+            }}>ADVANCED</span>
+          </button>
         </div>
       </div>
+
       <div className="tv-chart-shell">
         <div className="tv-chart" ref={chartContainerRef} />
         <div className="tv-tooltip" ref={tooltipRef} />
       </div>
+
+      {/* Default legend — always visible, calm, no surprises */}
       <div className="chart-legend">
         <span><i className="legend-current" />Current</span>
         <span><i className="legend-buy" />Buy zone</span>
         <span><i className="legend-risk" />Risk line</span>
         <span><i className="legend-review" />Targets</span>
       </div>
+
+      {/* ── Pro Mode legend + educational tooltips ──────────────────────────
+          Only renders when Pro is ON. The panel is collapsible so users
+          who already know what they're looking at can hide it. */}
+      {proMode && (
+        <div style={{
+          marginTop: 'var(--space-3)',
+          background: 'var(--bg-surface-2)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 10,
+          overflow: 'hidden',
+        }}>
+          <button
+            onClick={() => setLegendOpen(o => !o)}
+            style={{
+              width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: 'var(--space-3) var(--space-4)',
+              background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left',
+              color: 'var(--text-primary)', fontWeight: 600, fontSize: 'var(--text-sm)',
+            }}
+          >
+            <span>📚 Pro Analysis legend &amp; explanations</span>
+            <span style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>{legendOpen ? '−' : '+'}</span>
+          </button>
+          {legendOpen && (
+            <div style={{ padding: '0 var(--space-4) var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+              <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', lineHeight: 1.6, margin: 0 }}>
+                Hover any item to see what it means. None of these are buy/sell triggers on their own — they're additional context to layer on top of your KTrade decision.
+              </p>
+
+              {/* Color-keyed overlay rows */}
+              {[
+                { k: 'ema21',  swatch: '#06b6d4', label: 'EMA 21',  desc: 'Fast-reacting average. Often acts as a dynamic floor in healthy uptrends.' },
+                { k: 'sma50',  swatch: '#f59e0b', label: 'SMA 50',  desc: 'Medium-term trend gauge. Crossings vs SMA 200 are widely watched.' },
+                { k: 'sma200', swatch: '#c084fc', label: 'SMA 200', desc: 'Long-term tide. Above = bull regime; below = bear regime.' },
+                { k: 'fibRet', swatch: '#fb7185', label: 'Fibonacci retracements', desc: 'Where pullbacks often pause. 0.5 and 0.618 are the most-watched.' },
+                { k: 'fibExt', swatch: '#ec4899', label: 'Fibonacci extensions',   desc: 'Profit-take zones beyond the prior swing high. 1.272 and 1.618 are classics.' },
+                { k: 'volume', swatch: 'linear-gradient(90deg,#22c55e 50%,#ef4444 50%)', label: 'Colored volume', desc: 'Green = close ≥ open (buyers in control). Red = close < open. Heavy bars confirm moves.' },
+                { k: 'patterns', swatch: 'transparent', icon: '🔨💫⬆⬇✦', label: 'Candlestick patterns', desc: 'Markers where Hammer / Shooting Star / Engulfing / Doji appeared. Use as "second-look" signals.' },
+              ].map(item => (
+                <div
+                  key={item.k}
+                  onMouseEnter={() => setHelpKey(item.k)}
+                  onMouseLeave={() => setHelpKey(null)}
+                  style={{
+                    display: 'flex', alignItems: 'flex-start', gap: 12,
+                    padding: 'var(--space-2) var(--space-3)',
+                    borderRadius: 8,
+                    background: helpKey === item.k ? 'var(--bg-surface-3)' : 'transparent',
+                    cursor: 'help',
+                    transition: 'background 0.15s ease',
+                  }}
+                >
+                  <span style={{
+                    flexShrink: 0, marginTop: 4,
+                    width: 28, height: 4, borderRadius: 2,
+                    background: item.swatch,
+                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 11,
+                  }}>{item.icon && <span style={{ position: 'relative', top: -8, color: 'var(--text-primary)' }}>{item.icon}</span>}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600, color: 'var(--text-primary)' }}>{item.label}</div>
+                    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', lineHeight: 1.5, marginTop: 2 }}>
+                      {item.desc}
+                    </div>
+                    {helpKey === item.k && (PRO_OVERLAY_HELP as any)[item.k] && (
+                      <div style={{
+                        fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)',
+                        lineHeight: 1.6, marginTop: 'var(--space-2)',
+                        padding: 'var(--space-2) var(--space-3)',
+                        background: 'var(--bg-surface-2)', borderRadius: 6,
+                        borderLeft: '2px solid var(--blue-text)',
+                      }}>
+                        💡 {(PRO_OVERLAY_HELP as any)[item.k]}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {/* Detected patterns table — only shown when at least one pattern was found */}
+              {proChart?.patterns && proChart.patterns.length > 0 && (
+                <div style={{ marginTop: 'var(--space-2)' }}>
+                  <div style={{ fontSize: 'var(--text-xs)', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 'var(--space-2)' }}>
+                    Patterns detected on the visible window:
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {proChart.patterns.slice().reverse().map((p, i) => (
+                      <div key={i} style={{
+                        display: 'flex', alignItems: 'center', gap: 10,
+                        padding: '6px 10px', borderRadius: 6,
+                        background: p.direction === 'bullish' ? 'var(--green-muted)'
+                                  : p.direction === 'bearish' ? 'var(--red-muted)'
+                                  : 'var(--bg-surface-3)',
+                        fontSize: 'var(--text-xs)',
+                      }}>
+                        <span style={{ fontSize: 14 }}>{p.icon}</span>
+                        <span style={{ fontWeight: 600, color: 'var(--text-primary)', minWidth: 140 }}>{p.label}</span>
+                        <span style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>{p.date}</span>
+                        <span style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>${p.price.toFixed(2)}</span>
+                        <span style={{ color: 'var(--text-secondary)', flex: 1 }}>{p.summary}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Fib setup metadata */}
+              {proChart?.fib && (
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-2)' }}>
+                  <b>Fib base swing:</b> {proChart.fib.direction === 'up' ? '↑' : '↓'} from
+                  ${proChart.fib.start_price.toFixed(2)} ({proChart.fib.start_date.slice(0, 10)})
+                  to ${proChart.fib.end_price.toFixed(2)} ({proChart.fib.end_date.slice(0, 10)})
+                  — a {proChart.fib.swing_pct.toFixed(1)}% move.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* "Read" copy is the same in both modes — it's about the engine's call,
+          not the chart drawing style. */}
       <div className="chart-read">
         <span><b>Read:</b> {decisionNudge({ ...score, price: currentPrice } as Card)}</span>
         {buyRange && <span><b>Buy zone:</b> Green lines = lower and upper edge of the preferred entry area.</span>}
@@ -1356,7 +1727,7 @@ function TickerView({ symbol, setSymbol }: { symbol: string; setSymbol: (s: stri
             </article>
           </div>
 
-          <PriceChart prices={detail.prices} score={score} indicators={indicators} />
+          <PriceChart prices={detail.prices} score={score} indicators={indicators} proChart={detail.pro_chart} />
 
           <div className="detail-grid">
             <article className="panel panel-sm">
