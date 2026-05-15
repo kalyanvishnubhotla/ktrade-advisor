@@ -664,6 +664,33 @@ function PriceChart({ prices, score, indicators, proChart }: {
     }
 
     // ── KTrade calm levels — same in both modes ──────────────────────
+    //
+    // Note on autoscale: lightweight-charts' `createPriceLine()` draws an
+    // overlay but does NOT pull the Y-axis to include that price. When a
+    // target sits above the highest historical price (fresh-high targets)
+    // or a risk line sits below the lowest, the label gets clipped off the
+    // canvas — the user only sees it inside the Decision Plan card.
+    //
+    // Fix: for every off-chart price line that matters, we additionally drop
+    // a fully transparent 2-point line series at that price spanning the
+    // visible time window. The chart's autoscale stretches to include the
+    // invisible series, which in turn keeps the price-line label on-screen.
+    // The user sees nothing extra — just the axis label they expect.
+    const pinAutoscaleToPrice = (price: number) => {
+      if (!lineData.length || !Number.isFinite(price)) return;
+      const pin = chart.addSeries(LineSeries, {
+        color:                  'rgba(0,0,0,0)',  // fully transparent
+        lineWidth:              1,
+        priceLineVisible:       false,            // no extra axis label
+        lastValueVisible:       false,            // no badge in the gutter
+        crosshairMarkerVisible: false,            // doesn't interact with crosshair
+      });
+      pin.setData([
+        { time: lineData[0].time,                       value: price },
+        { time: lineData[lineData.length - 1].time,     value: price },
+      ] as any);
+    };
+
     if (buyRange) {
       priceSeries.createPriceLine({ price: buyRange.high, color: '#00C805', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `Buy high $${buyRange.high.toFixed(2)}` });
       priceSeries.createPriceLine({ price: buyRange.low,  color: '#00C805', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `Buy low $${buyRange.low.toFixed(2)}` });
@@ -673,12 +700,15 @@ function PriceChart({ prices, score, indicators, proChart }: {
     }
     if (riskLine) {
       priceSeries.createPriceLine({ price: riskLine, color: '#FF5000', lineWidth: 2, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `Risk $${riskLine.toFixed(2)}` });
+      pinAutoscaleToPrice(riskLine);                  // keep visible if far below data
     }
     if (firstTarget) {
       priceSeries.createPriceLine({ price: firstTarget, color: '#F5A623', lineWidth: 2, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `T1 $${firstTarget.toFixed(2)}` });
+      pinAutoscaleToPrice(firstTarget);               // keep visible when above data (fresh-high targets)
     }
     if (secondTarget) {
       priceSeries.createPriceLine({ price: secondTarget, color: '#F5A623', lineWidth: 1, lineStyle: LineStyle.LargeDashed, axisLabelVisible: true, title: `T2 $${secondTarget.toFixed(2)}` });
+      pinAutoscaleToPrice(secondTarget);              // ditto for T2
     }
 
     // ── PRO MODE OVERLAYS ─────────────────────────────────────────────
