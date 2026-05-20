@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import threading
 import time
@@ -15,6 +16,14 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+# ── Quiet third-party log noise ──────────────────────────────────────────────
+# ETFs and many ETPs don't have fundamentals / earnings dates, so yfinance
+# emits ugly "HTTP Error 404" and "No earnings dates found, symbol may be
+# delisted" lines for them on every refresh. These are expected and handled
+# internally — silencing keeps the terminal usable.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 from .analysis import DISCLAIMER
 from .database import ROOT, db, init_db, rows_to_dicts, seed_defaults, upsert_ticker
@@ -174,6 +183,14 @@ def dashboard() -> dict:
                 FROM tickers t
                 LEFT JOIN indicators i ON i.ticker_id = t.id
                 LEFT JOIN scores s ON s.id = (SELECT id FROM scores WHERE ticker_id = t.id ORDER BY as_of DESC LIMIT 1)
+                -- Only surface tickers that belong to at least one ACTIVE watchlist.
+                -- Toggling a watchlist Inactive (or removing a ticker from every
+                -- active list) makes its cards vanish from the dashboard.
+                WHERE t.id IN (
+                    SELECT wt.ticker_id FROM watchlist_tickers wt
+                    JOIN watchlists w ON w.id = wt.watchlist_id
+                    WHERE w.active = 1
+                )
                 ORDER BY COALESCE(s.score, 0) DESC, t.symbol
                 """
             ).fetchall()
@@ -510,15 +527,72 @@ def remove_ticker(watchlist_id: int, symbol: str) -> dict:
     return {"ok": True}
 
 
+def _symbol_exists_on_yahoo(symbol: str) -> bool:
+    """
+    Quick one-shot check: does Yahoo actually have price data for this symbol?
+    Used to gate POST /api/watchlists/{id}/tickers so a typo'd or delisted
+    symbol fails fast with a clean message, instead of silently creating a
+    dead `tickers` row that then haunts the dashboard forever.
+
+    Falls back to True if the network call itself errors out — we'd rather
+    accept the symbol than block on a transient Yahoo hiccup.
+    """
+    try:
+        import yfinance as _yf
+        df = _yf.Ticker(symbol.strip().upper()).history(period="5d", auto_adjust=False)
+        return df is not None and not df.empty
+    except Exception:
+        return True  # don't punish the user for a Yahoo blip
+
+
 @app.post("/api/watchlists/{watchlist_id}/tickers")
 def add_ticker(watchlist_id: int, payload: TickerIn) -> dict:
     with db() as conn:
         watchlist = conn.execute("SELECT * FROM watchlists WHERE id = ?", (watchlist_id,)).fetchone()
         if not watchlist:
             raise HTTPException(404, "Watchlist not found")
-        ticker_id = upsert_ticker(conn, payload.symbol, payload.company, payload.theme or watchlist["theme"])
+
+    # Validate the symbol BEFORE we create any rows. Hitting Yahoo here is
+    # synchronous (~0.5–1s) but it's a one-time user action, and it prevents
+    # the "dead card I can't get rid of" UX trap.
+    cleaned = (payload.symbol or "").strip().upper()
+    if not cleaned:
+        raise HTTPException(422, "Please enter a ticker symbol.")
+    if not _symbol_exists_on_yahoo(cleaned):
+        raise HTTPException(
+            422,
+            f"Symbol '{cleaned}' wasn't found on Yahoo Finance. Check the spelling "
+            "(e.g. BRK-B not BRK.B) or try a different exchange suffix.",
+        )
+
+    with db() as conn:
+        ticker_id = upsert_ticker(conn, cleaned, payload.company, payload.theme or watchlist["theme"])
         conn.execute("INSERT OR IGNORE INTO watchlist_tickers VALUES (?, ?)", (watchlist_id, ticker_id))
     return {"ok": True}
+
+
+@app.delete("/api/tickers/{symbol}")
+def delete_ticker(symbol: str) -> dict:
+    """
+    Permanently delete a ticker from the entire app.
+
+    All child rows clean up automatically via FOREIGN KEY ON DELETE CASCADE
+    (watchlist_tickers, prices, indicators, scores, pivots, fib_zones,
+    sr_zones, news_ticker_matches, recommendation_snapshots, research_signals,
+    and the cascaded tracked_decisions / outcomes off snapshots).
+
+    Use case: a typo'd symbol left a dead card, or the user no longer wants
+    to track a stock and wants it gone from history entirely.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        raise HTTPException(422, "Missing ticker symbol")
+    with db() as conn:
+        row = conn.execute("SELECT id FROM tickers WHERE symbol = ?", (sym,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Ticker '{sym}' not found")
+        conn.execute("DELETE FROM tickers WHERE id = ?", (row["id"],))
+    return {"ok": True, "deleted": sym}
 
 
 @app.get("/api/tickers/{symbol}")

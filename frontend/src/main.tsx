@@ -216,12 +216,14 @@ function SignalIntelBadges({ card }: { card: Card }) {
 }
 
 // ── TickerCard ────────────────────────────────────────────────────────────────
-function TickerCard({ card, showHelp, onSelect, onTrack }: {
+function TickerCard({ card, showHelp, onSelect, onTrack, onRemove }: {
   card: Card; showHelp: boolean;
   onSelect: (symbol: string) => void;
   onTrack: (symbol: string) => Promise<void>;
+  onRemove?: (symbol: string) => Promise<void>;
 }) {
   const [tracking, setTracking] = useState(false);
+  const [removing, setRemoving] = useState(false);
   return (
     <article className="ticker-card" onClick={() => onSelect(card.symbol)}>
       {/* Header */}
@@ -230,7 +232,36 @@ function TickerCard({ card, showHelp, onSelect, onTrack }: {
           <div className="ticker-symbol">{card.symbol}</div>
           <div className="ticker-company">{card.company || card.theme}</div>
         </div>
-        <ScoreBadge score={card.score} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <ScoreBadge score={card.score} />
+          {/*
+            Small "×" that hard-deletes the ticker from the app entirely
+            (cascades to watchlists, prices, scores, snapshots).
+            Use case: typo'd symbol, no longer tracking. One confirm dialog.
+          */}
+          {onRemove && (
+            <button
+              type="button"
+              title={`Remove ${card.symbol} from all watchlists and delete its history`}
+              disabled={removing}
+              onClick={async (e) => {
+                e.stopPropagation();
+                if (!window.confirm(`Remove ${card.symbol} entirely? This deletes it from every watchlist and erases its score history. (You can add it back later.)`)) return;
+                setRemoving(true);
+                try { await onRemove(card.symbol); } finally { setRemoving(false); }
+              }}
+              style={{
+                background: 'transparent', border: '1px solid var(--border-subtle)',
+                color: 'var(--text-tertiary)', borderRadius: 6,
+                width: 22, height: 22, padding: 0, fontSize: 14, lineHeight: 1,
+                cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                opacity: removing ? 0.5 : 0.6,
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
+              onMouseLeave={(e) => (e.currentTarget.style.opacity = removing ? '0.5' : '0.6')}
+            >×</button>
+          )}
+        </div>
       </div>
 
       {/* Decision + price */}
@@ -1005,11 +1036,12 @@ function PriceChart({ prices, score, indicators, proChart }: {
 }
 
 // ── DashboardView ─────────────────────────────────────────────────────────────
-function DashboardView({ cards, watchlists, news, showHelp, onSelect, onTrack }: {
+function DashboardView({ cards, watchlists, news, showHelp, onSelect, onTrack, onRemove }: {
   cards: Card[]; watchlists: Watchlist[]; news: NewsItem[];
   showHelp: boolean;
   onSelect: (symbol: string) => void;
   onTrack: (symbol: string) => Promise<void>;
+  onRemove: (symbol: string) => Promise<void>;
 }) {
   const [filter, setFilter] = useState<DashboardFilter>('all');
   const [sort, setSort] = useState<DashboardSort>('score');
@@ -1117,7 +1149,7 @@ function DashboardView({ cards, watchlists, news, showHelp, onSelect, onTrack }:
       {viewMode === 'cards' ? (
         <div className="card-grid">
           {filtered.map((card) => (
-            <TickerCard key={card.symbol} card={card} showHelp={showHelp} onSelect={onSelect} onTrack={onTrack} />
+            <TickerCard key={card.symbol} card={card} showHelp={showHelp} onSelect={onSelect} onTrack={onTrack} onRemove={onRemove} />
           ))}
           {!filtered.length && (
             <div className="panel" style={{ gridColumn: '1/-1', color: 'var(--text-tertiary)', textAlign: 'center' }}>
@@ -1341,6 +1373,8 @@ function WatchlistsView({ reload }: { reload: () => Promise<void> }) {
   const [theme, setTheme] = useState('');
   const [tickerInputs, setTickerInputs] = useState<Record<number, string>>({});
   const [edits, setEdits] = useState<Record<number, { name: string; theme: string; active: boolean }>>({});
+  // Surfaced when /api/watchlists/{id}/tickers returns 422 — e.g. symbol not on Yahoo.
+  const [addError, setAddError] = useState<{ listId: number; msg: string } | null>(null);
 
   const load = async () => {
     const lists = await getJson<Watchlist[]>('/api/watchlists');
@@ -1359,9 +1393,19 @@ function WatchlistsView({ reload }: { reload: () => Promise<void> }) {
   const addTicker = async (id: number, listTheme: string) => {
     const symbol = tickerInputs[id]?.trim();
     if (!symbol) return;
-    await sendJson(`/api/watchlists/${id}/tickers`, { symbol, theme: listTheme });
-    setTickerInputs({ ...tickerInputs, [id]: '' });
-    await load();
+    setAddError(null);
+    try {
+      await sendJson(`/api/watchlists/${id}/tickers`, { symbol, theme: listTheme });
+      setTickerInputs({ ...tickerInputs, [id]: '' });
+      await load();
+    } catch (err) {
+      // Server returns a clean 422 with a human message when the symbol isn't
+      // valid on Yahoo Finance. Show it inline next to that watchlist's input.
+      const msg = err instanceof Error ? err.message : 'Could not add ticker';
+      // Strip the boring HTTP prefix from messages like "422: Symbol 'XYZ' wasn't found..."
+      const clean = msg.replace(/^\d{3}:?\s*/, '').replace(/^Error:\s*/, '');
+      setAddError({ listId: id, msg: clean });
+    }
   };
 
   const saveList = async (id: number) => {
@@ -1417,9 +1461,14 @@ function WatchlistsView({ reload }: { reload: () => Promise<void> }) {
               ))}
             </div>
             <div className="form-row nested">
-              <input value={tickerInputs[list.id] || ''} onChange={(e) => setTickerInputs({ ...tickerInputs, [list.id]: e.target.value.toUpperCase() })} placeholder="Add ticker (e.g. AAPL)" onKeyDown={(e) => { if (e.key === 'Enter') addTicker(list.id, list.theme); }} />
+              <input value={tickerInputs[list.id] || ''} onChange={(e) => { setTickerInputs({ ...tickerInputs, [list.id]: e.target.value.toUpperCase() }); if (addError?.listId === list.id) setAddError(null); }} placeholder="Add ticker (e.g. AAPL)" onKeyDown={(e) => { if (e.key === 'Enter') addTicker(list.id, list.theme); }} />
               <button className="btn btn-secondary btn-sm" onClick={() => addTicker(list.id, list.theme)}>Add</button>
             </div>
+            {addError?.listId === list.id && (
+              <div style={{ marginTop: 'var(--space-2)', padding: 'var(--space-2) var(--space-3)', background: 'var(--red-muted, rgba(255,80,0,0.08))', border: '1px solid var(--red-dim, rgba(255,80,0,0.3))', borderRadius: 8, fontSize: 'var(--text-xs)', color: 'var(--red-text, #FF5000)' }}>
+                ⚠ {addError.msg}
+              </div>
+            )}
           </article>
         ))}
       </div>
@@ -4352,6 +4401,24 @@ function App() {
     window.setTimeout(() => setToast(''), 3500);
   };
 
+  /**
+   * Hard-delete a ticker from the entire app.
+   * Triggered from the small × on a dashboard card. The backend cascades the
+   * delete to watchlist_tickers, prices, indicators, scores, snapshots, etc.
+   * After success, reload the dashboard so the card disappears immediately.
+   */
+  const onRemoveTicker = async (symbol: string) => {
+    try {
+      await sendJson(`/api/tickers/${encodeURIComponent(symbol)}`, undefined, 'DELETE');
+      setToast(`${symbol} removed.`);
+      window.setTimeout(() => setToast(''), 2500);
+      await load();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Remove failed';
+      setError(msg.replace(/^\d{3}:?\s*/, '').replace(/^Error:\s*/, ''));
+    }
+  };
+
   const goToTicker = (symbol: string) => {
     setSelectedTicker(symbol);
     setPage('ticker');
@@ -4464,7 +4531,7 @@ function App() {
           {error && !loading && <div className="alert" style={{ marginBottom: 'var(--space-5)' }}><ShieldAlert size={16} />{error}</div>}
 
           {!loading && page === 'dashboard' && (
-            <DashboardView cards={cards} watchlists={dashboard?.watchlists ?? []} news={dashboard?.news.latest ?? []} showHelp={showHelp} onSelect={goToTicker} onTrack={onTrack} />
+            <DashboardView cards={cards} watchlists={dashboard?.watchlists ?? []} news={dashboard?.news.latest ?? []} showHelp={showHelp} onSelect={goToTicker} onTrack={onTrack} onRemove={onRemoveTicker} />
           )}
           {page === 'watchlists' && <WatchlistsView reload={load} />}
           {page === 'ticker' && <TickerView symbol={selectedTicker} setSymbol={setSelectedTicker} />}

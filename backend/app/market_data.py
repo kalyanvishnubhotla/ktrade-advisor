@@ -473,7 +473,20 @@ def refresh_all(
     started = datetime.now(timezone.utc)
 
     with db() as conn:
-        tickers = rows_to_dicts(conn.execute("SELECT * FROM tickers ORDER BY symbol").fetchall())
+        # Only refresh tickers that belong to at least one ACTIVE watchlist.
+        # Inactive watchlists are skipped — saves Yahoo round-trips and keeps
+        # the dashboard in sync with what the user actually wants tracked.
+        tickers = rows_to_dicts(conn.execute(
+            """
+            SELECT t.* FROM tickers t
+            WHERE t.id IN (
+                SELECT wt.ticker_id FROM watchlist_tickers wt
+                JOIN watchlists w ON w.id = wt.watchlist_id
+                WHERE w.active = 1
+            )
+            ORDER BY t.symbol
+            """
+        ).fetchall())
 
     if not tickers:
         return {"refreshed": [], "failed": [], "snapshots_saved": 0,
